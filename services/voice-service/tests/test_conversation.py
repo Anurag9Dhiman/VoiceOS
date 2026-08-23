@@ -81,28 +81,50 @@ def _controller(client: FakeClient, router_class: str | None = None):
     return controller, speak_calls
 
 
-def test_small_talk_speaks_locally_without_sending_anything():
+def test_small_talk_is_proposed_then_spoken_locally_on_approval():
     async def scenario():
         client = FakeClient()
         controller, speak_calls = _controller(client, "small_talk")
         await controller.start(session_id="s1", user_id="u1")
 
         await controller.handle_utterance("hey")
+        assert speak_calls[-1] == ("I'm ready to reply. OK to proceed?", "high")
+        assert client.sent == []
 
-        assert speak_calls == [("ack:small_talk", "low")]
+        await controller.handle_utterance("yes go ahead")
+        assert speak_calls[-1] == ("ack:small_talk", "low")
         assert client.sent == []
         await controller.stop()
 
     asyncio.run(scenario())
 
 
-def test_new_intent_forwards_as_user_utterance():
+def test_small_talk_proposal_is_dropped_on_rejection():
+    async def scenario():
+        client = FakeClient()
+        controller, speak_calls = _controller(client, "small_talk")
+        await controller.start(session_id="s1", user_id="u1")
+
+        await controller.handle_utterance("hey")
+        await controller.handle_utterance("no, don't")
+
+        assert speak_calls[-1] == ("Okay, cancelled.", "low")
+        assert client.sent == []
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_new_intent_forwards_as_user_utterance_once_approved():
     async def scenario():
         client = FakeClient()
         controller, _ = _controller(client, "new_intent")
         await controller.start(session_id="s1", user_id="u1")
 
         await controller.handle_utterance("clear my morning, I'm sick")
+        assert client.sent == []  # proposed, not sent yet
+
+        await controller.handle_utterance("yes go ahead")
 
         assert len(client.sent) == 1
         sent = client.sent[0]
@@ -140,11 +162,43 @@ def test_modify_inflight_sends_interrupt_targeting_current_task():
         await _settle()
 
         await controller.handle_utterance("wait, keep the 10am")
+        assert client.sent == []  # proposed, not sent yet
+
+        await controller.handle_utterance("yes go ahead")
 
         interrupt = client.sent[-1]
         assert isinstance(interrupt, Interrupt)
         assert interrupt.target_task_id == "t1"
         assert interrupt.text == "wait, keep the 10am"
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_modify_inflight_targets_the_task_current_at_proposal_time_not_approval_time():
+    """The target task is captured when the action is proposed, so it can't
+    drift if current_task_id changes while the proposal is awaiting the
+    user's approval."""
+
+    async def scenario():
+        client = FakeClient()
+        controller, _ = _controller(client, "modify_inflight")
+        await controller.start(session_id="s1", user_id="u1")
+        client.push(Ack(task_id="t1", text="Checking your calendar now."))
+        await _settle()
+
+        await controller.handle_utterance("wait, keep the 10am")  # proposed while t1 is current
+
+        # A second task becomes current before the user answers.
+        client.push(Ack(task_id="t2", text="Starting a different task."))
+        await _settle()
+        assert controller.current_task_id == "t2"
+
+        await controller.handle_utterance("yes go ahead")
+
+        interrupt = client.sent[-1]
+        assert isinstance(interrupt, Interrupt)
+        assert interrupt.target_task_id == "t1"  # still t1, not the now-current t2
         await controller.stop()
 
     asyncio.run(scenario())
@@ -191,13 +245,16 @@ def test_confirmation_reply_maps_to_decision(text, expected_decision, expected_m
     asyncio.run(scenario())
 
 
-def test_session_query_forwards_the_query():
+def test_session_query_forwards_the_query_once_approved():
     async def scenario():
         client = FakeClient()
         controller, _ = _controller(client, "session_query")
         await controller.start(session_id="s1", user_id="u1")
 
         await controller.handle_utterance("where were we")
+        assert client.sent == []  # proposed, not sent yet
+
+        await controller.handle_utterance("yes go ahead")
 
         sent = client.sent[-1]
         assert isinstance(sent, SessionQuery)
@@ -282,6 +339,7 @@ def test_new_intent_attaches_resolved_pronouns_as_entity_refs():
         await _settle()
 
         await controller.handle_utterance("actually, keep it")
+        await controller.handle_utterance("yes go ahead")
 
         sent = client.sent[-1]
         assert isinstance(sent, UserUtterance)

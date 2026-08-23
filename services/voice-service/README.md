@@ -20,6 +20,12 @@ concern from the live audio path, which needs its own `GOOGLE_API_KEY`.
 
 ## How a turn flows
 
+0. The session stays completely silent until `Settings.wake_word` (default
+   `"hey voiceos"`) is heard — checked in code against the real transcript
+   (`agent.py`'s `WakeState`/`_after_wake_word`), not left to the model's
+   own judgment, for the same reason as step 1's reactive safety net below:
+   instructions alone aren't enforced for this session type. Once awake,
+   stays awake for the rest of the call.
 1. Gemini Live's own turn detection decides when the user's turn ends, then
    the model is instructed to call `classify_utterance` — the only reliable
    per-turn hook into a `RealtimeModel` session (`agent.py`'s
@@ -31,32 +37,42 @@ concern from the live audio path, which needs its own `GOOGLE_API_KEY`.
    self-reported paraphrase.
 2. The tool handler calls `ConversationController.handle_utterance`
    (`conversation.py`) directly with that transcript and the model's
-   chosen category — one of the six from the contract. This state machine
-   is unchanged from the cascaded-pipeline design and has no LiveKit
-   import at all.
-3. `small_talk`/`simple_lookup` → the tool handler tells the model to
-   answer briefly itself; `ack.py`'s `simple_lookup` path still makes one
-   real text-completion call, never crosses the wire to CollectiveOS.
-4. Everything else → the tool handler calls `session.interrupt()` (forced
-   tool-choice isn't honored for Gemini Live through LiveKit, so this is a
-   *reactive* safety net, not a guarantee the model stayed silent) and
-   forwards to CollectiveOS over `ReconnectingCollectiveOSClient`
-   (`resilient_client.py`, wraps the raw `collectiveos_client.py`; points
-   at `mock-agent-backend` by default) as `user_utterance` / `interrupt` /
-   `confirmation_response` / `session_query`. `new_intent` utterances get
-   pronouns resolved against `entity_stack.py` first (attached as
-   `entity_refs`). An unexpected drop is retried with exponential backoff
-   and resumes the same session automatically — `handle_utterance`'s send
-   side and `_receive_loop`'s receive side don't need to know a reconnect
-   happened.
-5. Whatever CollectiveOS sends back is spoken via `speech_composer.py`
+   chosen category — one of the six from the contract.
+3. **Every** classified action — `small_talk`, `simple_lookup`,
+   `new_intent`, `modify_inflight`, `session_query` — is proposed and held
+   as a `_PendingAction`, not acted on immediately: `handle_utterance`
+   speaks a short description ("I'll ask CollectiveOS to handle: '...'. OK
+   to proceed?") and waits. The *next* utterance is consumed as the
+   approve/reject answer (`_parse_decision`, the same parser
+   `confirmation_reply` already used) rather than being classified — only
+   on approval does `_execute_action` run the original logic.
+   `confirmation_reply` itself is exempt (it's already the user's
+   confirmation of something CollectiveOS asked; gating it again would be
+   circular) and still forwards immediately, unchanged.
+4. `small_talk`/`simple_lookup`, once approved → the tool handler tells the
+   model to answer briefly itself; `ack.py`'s `simple_lookup` path still
+   makes one real text-completion call, never crosses the wire to
+   CollectiveOS.
+5. Everything else, once approved → the tool handler calls
+   `session.interrupt()` (forced tool-choice isn't honored for Gemini Live
+   through LiveKit, so this is a *reactive* safety net, not a guarantee the
+   model stayed silent) and forwards to CollectiveOS over
+   `ReconnectingCollectiveOSClient` (`resilient_client.py`, wraps the raw
+   `collectiveos_client.py`; points at `mock-agent-backend` by default) as
+   `user_utterance` / `interrupt` / `confirmation_response` /
+   `session_query`. `new_intent` utterances get pronouns resolved against
+   `entity_stack.py` first (attached as `entity_refs`). An unexpected drop
+   is retried with exponential backoff and resumes the same session
+   automatically — `handle_utterance`'s send side and `_receive_loop`'s
+   receive side don't need to know a reconnect happened.
+6. Whatever CollectiveOS sends back is spoken via `speech_composer.py`
    (priority preemption, one-breath logging) → `agent.py`'s `speak`
    binding, which now drives `session.generate_reply(instructions=...)`
    rather than `session.say()` (`RealtimeCapabilities.supports_say` is
    `False` for this plugin), and tracks utterances a barge-in cut off as
    undelivered (`turn_manager.py`, riding `SpeechHandle.interrupted`, which
    `generate_reply()` returns just as `say()` did).
-6. Task state (which tasks are active, which is waiting on the user) and
+7. Task state (which tasks are active, which is waiting on the user) and
    the entity stack are snapshotted to a `SessionStore` (`session_store.py`
    — in-memory by default, Redis in production) keyed by user_id, so a
    session that resumes hours or days later picks up where it left off.
@@ -89,29 +105,47 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (87 tests, all green): the two load-bearing
+Unit- and integration-tested (107 tests, all green): the two load-bearing
 `RealtimeCapabilities` assumptions the Gemini Live design depends on
 (`supports_say`/`per_response_tool_choice`, both `False`, checked directly
 against the installed `livekit-plugins-google`, zero network),
 `classify_utterance`'s routing/interrupt/silence decisions and its
 `ScriptedSpeechGuard` recursion guard (`RoutingAgent` called directly, no
-real LiveKit session needed), the `raw_speak`→`generate_reply` binding,
-router tool-call parsing, ack templates, the full multi-task
-`ConversationController` state machine (including which task an
-unqualified follow-up targets when more than one is active), the entity
-stack's pronoun resolution and its deliberate refusal to treat
-sentence-initial capitalized words as entities, session snapshot/restore,
-the speech composer's priority and one-breath logic, the router eval
-harness's scoring/reporting (not the model's actual judgment — see below),
-the reconnect wrapper's backoff/give-up logic against a fake transport, the
-rate limiter's token-bucket math, the Gemini adapter's request/response
-translation against real `google-genai` types (constructed directly, no
-network) *and* that `HaikuRouter`/`AckGenerator` work against it completely
-unmodified, and all three reference scenarios *plus* an unexpected mid-task
-connection drop, end to end over a real socket.
+real LiveKit session needed), the wake gate (`_after_wake_word`'s
+one-breath "wake word + command" parsing, case-insensitivity, and rejecting
+a longer word that merely contains the phrase; asleep/awake behavior end to
+end through `classify_utterance`), the universal local confirmation gate
+(every gated category proposes and waits; approval executes the original
+action; rejection cancels it; `confirmation_reply` stays exempt;
+`modify_inflight`'s target task is captured at proposal time so it can't
+drift if a different task becomes current before the user answers), the
+`raw_speak`→`generate_reply` binding, router tool-call parsing, ack
+templates, the full multi-task `ConversationController` state machine
+(including which task an unqualified follow-up targets when more than one
+is active), the entity stack's pronoun resolution and its deliberate
+refusal to treat sentence-initial capitalized words as entities, session
+snapshot/restore, the speech composer's priority and one-breath logic, the
+router eval harness's scoring/reporting (not the model's actual judgment —
+see below), the reconnect wrapper's backoff/give-up logic against a fake
+transport, the rate limiter's token-bucket math, the Gemini adapter's
+request/response translation against real `google-genai` types
+(constructed directly, no network) *and* that `HaikuRouter`/`AckGenerator`
+work against it completely unmodified, and all three reference scenarios
+*plus* an unexpected mid-task connection drop, end to end over a real
+socket (each now driven through an explicit local-approval step per
+gated action, per the confirmation gate above).
 
 **Not verifiable in this environment** (in priority order for the Gemini
 Live migration specifically):
+- Whether real speech reliably contains the wake word cleanly enough for
+  `_after_wake_word`'s regex to catch it (accents, background noise,
+  Gemini Live's own transcription of the phrase itself) — the logic is
+  tested against plain text, not real audio
+- Whether the model reliably stays silent after a local proposal is spoken
+  (waiting for the approve/reject answer) rather than continuing to talk —
+  same root cause as the point below: forced tool-choice/instructions
+  aren't enforced for this session type, so this is best-effort like
+  everything else gated by instructions alone
 - Whether the model actually calls `classify_utterance` on ~every turn,
   and whether audio leaks before `session.interrupt()` lands for the four
   CollectiveOS-forwarding classes — forced tool-choice isn't honored for
@@ -196,7 +230,8 @@ for `voice-service dev`/`start` against a real room, not `console`.
 `SENTRY_DSN` is optional and read directly in `main()`, not through
 `Settings()` — same reasoning as `LIVEKIT_URL`: `--help` works with zero
 env vars set, and that has to keep being true as things get added, not
-just be true today.
+just be true today. `WAKE_WORD` defaults to `"hey voiceos"` — the session
+takes no action on anything until it's heard; see "How a turn flows" step 0.
 
 **A version pin worth knowing about:** `google-genai` (every published
 version) requires `websockets<17.0`, which conflicted with the

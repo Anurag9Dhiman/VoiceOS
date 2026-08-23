@@ -14,10 +14,14 @@ from voice_service.agent import (
     CLASSIFY_UTTERANCE_SCHEMA,
     RoutingAgent,
     ScriptedSpeechGuard,
+    WakeState,
     _AgentRef,
+    _after_wake_word,
     _context_instructions,
     _LatestUserTranscript,
 )
+
+_WAKE_WORD = "hey voiceos"
 
 
 class _FakeController:
@@ -36,11 +40,15 @@ class _FakeSession:
         self.interrupted = True
 
 
-def _agent():
+def _agent(*, awake: bool = True):
+    """Defaults to already-awake: these tests are about classify_utterance's
+    post-wake behavior. The wake gate itself gets its own dedicated tests
+    below."""
     controller = _FakeController()
     guard = ScriptedSpeechGuard()
     latest = _LatestUserTranscript()
-    agent = RoutingAgent(controller, guard, latest)
+    wake_state = WakeState(awake=awake)
+    agent = RoutingAgent(controller, guard, latest, wake_state, _WAKE_WORD)
     ctx = SimpleNamespace(session=_FakeSession())
     return agent, controller, guard, ctx
 
@@ -125,7 +133,9 @@ def test_agent_ref_holder_starts_empty_and_is_set_after_construction():
     assert ref.agent is None
 
     controller = _FakeController()
-    agent = RoutingAgent(controller, ScriptedSpeechGuard(), _LatestUserTranscript())
+    agent = RoutingAgent(
+        controller, ScriptedSpeechGuard(), _LatestUserTranscript(), WakeState(awake=True), _WAKE_WORD
+    )
     ref.agent = agent
 
     assert ref.agent is agent
@@ -142,3 +152,73 @@ def test_latest_captured_transcript_overrides_the_model_supplied_one():
     )
 
     assert controller.calls == [("the actual STT transcript", "new_intent")]
+
+
+def test_after_wake_word_returns_none_when_absent():
+    assert _after_wake_word("just talking normally", _WAKE_WORD) is None
+
+
+def test_after_wake_word_returns_the_remainder_in_one_breath():
+    assert _after_wake_word("hey voiceos, clear my morning", _WAKE_WORD) == "clear my morning"
+
+
+def test_after_wake_word_is_case_insensitive():
+    assert _after_wake_word("HEY VOICEOS clear my morning", _WAKE_WORD) == "clear my morning"
+
+
+def test_after_wake_word_returns_empty_string_for_the_phrase_alone():
+    assert _after_wake_word("hey voiceos", _WAKE_WORD) == ""
+
+
+def test_after_wake_word_rejects_a_longer_word_containing_the_phrase():
+    assert _after_wake_word("hey voiceostron activate", _WAKE_WORD) is None
+
+
+def test_asleep_with_no_wake_word_stays_silent_and_never_calls_the_controller():
+    agent, controller, _, ctx = _agent(awake=False)
+
+    result = asyncio.run(
+        agent.classify_utterance({"router_class": "new_intent", "transcript": "clear my morning"}, ctx)
+    )
+
+    assert "silent" in result.lower() or "wake" in result.lower()
+    assert controller.calls == []
+    assert agent._wake_state.awake is False
+
+
+def test_asleep_with_wake_word_and_command_wakes_and_processes_the_remainder():
+    agent, controller, _, ctx = _agent(awake=False)
+
+    result = asyncio.run(
+        agent.classify_utterance(
+            {"router_class": "new_intent", "transcript": "hey voiceos, clear my morning"}, ctx
+        )
+    )
+
+    assert agent._wake_state.awake is True
+    assert controller.calls == [("clear my morning", "new_intent")]
+    assert "silent" in result.lower()  # new_intent still tells the model to stay silent
+
+
+def test_asleep_with_wake_word_alone_wakes_without_calling_the_controller():
+    agent, controller, _, ctx = _agent(awake=False)
+
+    result = asyncio.run(
+        agent.classify_utterance({"router_class": "small_talk", "transcript": "hey voiceos"}, ctx)
+    )
+
+    assert agent._wake_state.awake is True
+    assert controller.calls == []
+    assert "listening" in result.lower() or "woke" in result.lower()
+
+
+def test_already_awake_is_unaffected_by_the_wake_gate():
+    """Once awake, later turns don't need to repeat the wake word --
+    matches every other test in this file, which all default to awake."""
+    agent, controller, _, ctx = _agent(awake=True)
+
+    asyncio.run(
+        agent.classify_utterance({"router_class": "new_intent", "transcript": "clear my morning"}, ctx)
+    )
+
+    assert controller.calls == [("clear my morning", "new_intent")]
