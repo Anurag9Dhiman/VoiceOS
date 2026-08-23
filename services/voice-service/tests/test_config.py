@@ -4,8 +4,7 @@ from voice_service.config import Settings
 
 
 def _speech_keys(monkeypatch):
-    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg_key")
-    monkeypatch.setenv("CARTESIA_API_KEY", "ca_key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "gg_key")
 
 
 def test_settings_load_from_env_with_anthropic_key(monkeypatch):
@@ -15,8 +14,7 @@ def test_settings_load_from_env_with_anthropic_key(monkeypatch):
 
     settings = Settings(_env_file=None)
 
-    assert settings.deepgram_api_key == "dg_key"
-    assert settings.cartesia_api_key == "ca_key"
+    assert settings.google_api_key == "gg_key"
     assert settings.anthropic_api_key == "an_key"
     assert settings.gemini_api_key is None
 
@@ -44,9 +42,8 @@ def test_collectiveos_ws_url_defaults_to_local_mock_backend(monkeypatch):
     assert settings.collectiveos_ws_url == "ws://localhost:8000/v1/ws"
 
 
-def test_settings_fail_fast_lists_every_missing_speech_key(monkeypatch):
-    for key in ("DEEPGRAM_API_KEY", "CARTESIA_API_KEY"):
-        monkeypatch.delenv(key, raising=False)
+def test_settings_fail_fast_when_google_api_key_missing(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "gm_key")  # satisfy the LLM-key requirement
 
     with pytest.raises(ValidationError) as exc_info:
@@ -55,7 +52,7 @@ def test_settings_fail_fast_lists_every_missing_speech_key(monkeypatch):
     # loc uses each field's validation_alias (the env var name), not the
     # Python attribute name.
     missing = {e["loc"][0] for e in exc_info.value.errors() if e["loc"]}
-    assert missing == {"DEEPGRAM_API_KEY", "CARTESIA_API_KEY"}
+    assert missing == {"GOOGLE_API_KEY"}
 
 
 def test_settings_require_at_least_one_llm_key(monkeypatch):

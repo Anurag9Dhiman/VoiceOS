@@ -1,7 +1,7 @@
-"""Env-driven settings for the speech plugins and the LLM provider. Fails
-fast with one combined error listing every missing key, rather than
-letting each plugin raise its own ValueError one at a time as it happens
-to be constructed.
+"""Env-driven settings for the realtime voice model and the ack/eval LLM
+provider. Fails fast with one combined error listing every missing key,
+rather than letting each plugin raise its own ValueError one at a time as
+it happens to be constructed.
 
 Deliberately doesn't include LIVEKIT_URL/API_KEY/API_SECRET: WorkerOptions
 already reads those itself with its own env fallback and only needs them
@@ -10,12 +10,17 @@ simulated local job and needs no LiveKit account at all). Requiring them
 here would block the fastest test path for no reason -- it did, in fact,
 until this was noticed.
 
-LLM provider: Anthropic (Claude Haiku) is the designed default for the
-router and ack generator, but not a hard requirement -- ANTHROPIC_API_KEY
-and GEMINI_API_KEY are each optional individually; at least one of the two
-must be present. Gemini support exists specifically because a live
-Anthropic key isn't always available (see gemini_client.py's adapter,
-which lets router.py/ack.py stay provider-agnostic).
+GOOGLE_API_KEY is the one hard requirement: it authenticates the Gemini
+Live RealtimeModel that now is the entire audio pipeline (STT+LLM+TTS in
+one full-duplex session -- see agent.py). GEMINI_LIVE_MODEL is separate
+from GEMINI_MODEL below on purpose: the former is the realtime audio model,
+the latter is the plain text-completion model AckGenerator's simple_lookup
+answer still uses, and they're independently overridable.
+
+ANTHROPIC_API_KEY/GEMINI_API_KEY are NOT the live audio path -- they feed
+AckGenerator's simple_lookup text completion and the offline router_eval
+harness only (see ack.py, gemini_client.py, router_eval.py). Each is
+optional individually; at least one of the two must be present.
 """
 
 from __future__ import annotations
@@ -29,8 +34,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    deepgram_api_key: str = Field(validation_alias="DEEPGRAM_API_KEY")
-    cartesia_api_key: str = Field(validation_alias="CARTESIA_API_KEY")
+    google_api_key: str = Field(validation_alias="GOOGLE_API_KEY")
+    # One of the two Gemini-Developer-API (non-Vertex) live models the
+    # installed livekit-plugins-google actually validates against --
+    # deliberately NOT gemini-3.1-flash-live-preview, whose mid-session
+    # instructions/tool updates don't apply until the next session (the
+    # plugin sets mutable_instructions=False for any "3.1" model), which
+    # would break generate_reply(instructions=...)-driven speech entirely.
+    gemini_live_model: str = Field(
+        default="gemini-2.5-flash-native-audio-preview-12-2025",
+        validation_alias="GEMINI_LIVE_MODEL",
+    )
 
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     gemini_api_key: str | None = Field(default=None, validation_alias="GEMINI_API_KEY")
