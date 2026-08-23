@@ -34,12 +34,21 @@ fidelity source: Gemini Live's own input transcription, surfaced as
 AgentSession's "conversation_item_added" events, is captured into
 _latest_user_transcript and preferred over the model-authored one whenever
 it's available for the same turn.
+
+Wake word: the session stays silent and takes no action on anything until
+Settings.wake_word is heard (checked in code against the real transcript,
+not left to the model's own judgment -- the same lesson as
+ScriptedSpeechGuard/the reactive interrupt() above: instructions alone
+aren't enforced for this session type). WakeState.awake flips true the
+first time the phrase is found and stays true for the rest of the call --
+no re-sleep phrase, no repeating the wake word for follow-up turns.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 from livekit.agents import (
@@ -111,6 +120,27 @@ class ScriptedSpeechGuard:
 
 
 @dataclass
+class WakeState:
+    """True once the wake word has been heard; stays true for the rest of
+    the call. See module docstring for why this is a code-level check
+    against the real transcript, not an instruction the model follows."""
+
+    awake: bool = False
+
+
+def _after_wake_word(text: str, wake_word: str) -> str | None:
+    """None if the phrase isn't present; otherwise whatever follows it, so
+    "hey voiceos, clear my morning" wakes and hands off the remainder as
+    this turn's utterance in one breath, matching normal wake-word UX."""
+    match = re.search(r"\b" + re.escape(wake_word) + r"\b", text, re.IGNORECASE)
+    if match is None:
+        return None
+    # Strip the separator punctuation people naturally say after a wake
+    # phrase ("hey voiceos, clear my morning") along with whitespace.
+    return text[match.end() :].strip(" ,:;-").strip()
+
+
+@dataclass
 class _LatestUserTranscript:
     """Gemini Live's own input transcription, captured from AgentSession's
     conversation_item_added events -- higher fidelity than the transcript
@@ -162,11 +192,15 @@ class RoutingAgent(Agent):
         controller: ConversationController,
         guard: ScriptedSpeechGuard,
         latest_transcript: _LatestUserTranscript,
+        wake_state: WakeState,
+        wake_word: str,
     ) -> None:
         super().__init__(instructions=_INSTRUCTIONS)
         self._controller = controller
         self._guard = guard
         self._latest_transcript = latest_transcript
+        self._wake_state = wake_state
+        self._wake_word = wake_word
 
     @function_tool(raw_schema=CLASSIFY_UTTERANCE_SCHEMA)
     async def classify_utterance(self, raw_arguments: dict[str, object], ctx: RunContext) -> str:
@@ -174,9 +208,18 @@ class RoutingAgent(Agent):
             return "That was your own scripted line, not a user turn. Ignore it."
 
         router_class = raw_arguments.get("router_class")
-        transcript = self._latest_transcript.text or raw_arguments.get("transcript") or ""
+        transcript = str(self._latest_transcript.text or raw_arguments.get("transcript") or "")
 
-        await self._controller.handle_utterance(str(transcript), router_class=router_class)  # type: ignore[arg-type]
+        if not self._wake_state.awake:
+            remainder = _after_wake_word(transcript, self._wake_word)
+            if remainder is None:
+                return "The wake word wasn't heard. Stay completely silent."
+            self._wake_state.awake = True
+            transcript = remainder
+            if not transcript:
+                return "Just woke up. Acknowledge briefly that you're listening now."
+
+        await self._controller.handle_utterance(transcript, router_class=router_class)  # type: ignore[arg-type]
 
         if router_class in _LOCAL_ANSWER_CLASSES:
             return "Go ahead and answer now, briefly."
@@ -233,6 +276,7 @@ async def entrypoint(ctx: JobContext) -> None:
     tracker = UndeliveredTracker()
     guard = ScriptedSpeechGuard()
     latest_transcript = _LatestUserTranscript()
+    wake_state = WakeState()
 
     session = AgentSession(
         llm=google.realtime.RealtimeModel(
@@ -292,7 +336,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_stop_controller)
 
-    routing_agent = RoutingAgent(controller, guard, latest_transcript)
+    routing_agent = RoutingAgent(controller, guard, latest_transcript, wake_state, settings.wake_word)
     agent_ref.agent = routing_agent
     await session.start(agent=routing_agent, room=ctx.room)
 

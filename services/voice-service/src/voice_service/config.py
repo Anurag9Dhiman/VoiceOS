@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     # this environment.
     redis_url: str | None = Field(default=None, validation_alias="REDIS_URL")
 
+    # The session stays silent and takes no action at all until this phrase
+    # is heard (case-insensitive, whole-phrase match) -- see agent.py's
+    # WakeState/_after_wake_word. Once heard, the session stays awake for
+    # the rest of the call; there's no re-sleep phrase.
+    wake_word: str = Field(default="hey voiceos", validation_alias="WAKE_WORD")
+
     @model_validator(mode="after")
     def _require_at_least_one_llm_key(self) -> Settings:
         if not self.anthropic_api_key and not self.gemini_api_key:

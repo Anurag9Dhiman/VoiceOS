@@ -6,7 +6,7 @@ or CollectiveOS.
 
 import asyncio
 
-from voice_contract import UserUtterance
+from voice_contract import Ack, ConfirmationResponse
 from voice_service.conversation import ConversationController
 from voice_service.rate_limiter import InMemoryRateLimiter
 
@@ -22,12 +22,20 @@ class _FakeClock:
 
 
 class CountingRouter:
+    """Classifies everything as confirmation_reply -- deliberately, so this
+    test isolates rate-limiting from the local confirmation gate (see
+    conversation.py's _LOCALLY_GATED_CLASSES): confirmation_reply is the one
+    category exempt from it, forwarding immediately every time, matching
+    this test's actual purpose -- "N floods through the rate limiter, N
+    reach the router" -- without a second, unrelated gate consuming some of
+    those calls as approve/reject answers instead of fresh utterances."""
+
     def __init__(self) -> None:
         self.calls = 0
 
     async def classify(self, text, *, has_active_task=False):
         self.calls += 1
-        return "new_intent"
+        return "confirmation_reply"
 
 
 def test_flooding_one_user_gets_throttled_before_reaching_the_router():
@@ -44,6 +52,11 @@ def test_flooding_one_user_gets_throttled_before_reaching_the_router():
             client=client, speak=speak, router=router, rate_limiter=limiter
         )
         await controller.start(session_id="s1", user_id="flooder")
+        # confirmation_reply needs an active task, or it's dropped before
+        # ever reaching the client -- give it one.
+        client.push(Ack(task_id="t1", text="Working on it."))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
         for i in range(5):
             await controller.handle_utterance(f"utterance {i}")
@@ -51,7 +64,7 @@ def test_flooding_one_user_gets_throttled_before_reaching_the_router():
         # Only the first 2 (the bucket's capacity) actually reached the
         # router and got forwarded; the rest were throttled.
         assert router.calls == 2
-        assert sum(1 for e in client.sent if isinstance(e, UserUtterance)) == 2
+        assert sum(1 for e in client.sent if isinstance(e, ConfirmationResponse)) == 2
         assert speak_calls.count(("Let's slow down a moment.", "low")) == 3
 
         await controller.stop()

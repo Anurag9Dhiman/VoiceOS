@@ -42,6 +42,26 @@ def test_collectiveos_ws_url_defaults_to_local_mock_backend(monkeypatch):
     assert settings.collectiveos_ws_url == "ws://localhost:8000/v1/ws"
 
 
+def test_wake_word_defaults_to_hey_voiceos(monkeypatch):
+    _speech_keys(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "gm_key")
+    monkeypatch.delenv("WAKE_WORD", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.wake_word == "hey voiceos"
+
+
+def test_wake_word_is_overridable(monkeypatch):
+    _speech_keys(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "gm_key")
+    monkeypatch.setenv("WAKE_WORD", "computer")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.wake_word == "computer"
+
+
 def test_settings_fail_fast_when_google_api_key_missing(monkeypatch):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "gm_key")  # satisfy the LLM-key requirement

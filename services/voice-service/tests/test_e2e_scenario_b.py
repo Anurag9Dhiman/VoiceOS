@@ -39,6 +39,7 @@ def test_scenario_b_hangup_and_resume_next_session():
             await controller1.handle_utterance(
                 "help me prep for the board meeting Friday", router_class="new_intent"
             )
+            await controller1.handle_utterance("yes go ahead")  # approve the local proposal
             await _wait_until(lambda: controller1.waiting_reason == "external")
             assert controller1.active_task_ids
 
@@ -65,6 +66,7 @@ def test_scenario_b_hangup_and_resume_next_session():
             assert controller2.active_task_ids == controller1.active_task_ids
 
             await controller2.handle_utterance("where were we", router_class="session_query")
+            await controller2.handle_utterance("yes go ahead")  # approve the local proposal
             await _wait_until(lambda: controller2.current_task_id is None)
 
             spoken = [t for t, _ in second_call_speech]

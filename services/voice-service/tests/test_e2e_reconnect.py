@@ -40,6 +40,7 @@ def test_unexpected_drop_mid_task_recovers_and_completes():
             await controller.handle_utterance(
                 "help me prep for the board meeting Friday", router_class="new_intent"
             )
+            await controller.handle_utterance("yes go ahead")  # approve the local proposal
             await _wait_until(lambda: controller.waiting_reason == "external")
             task_id_before_drop = controller.current_task_id
 
@@ -61,6 +62,7 @@ def test_unexpected_drop_mid_task_recovers_and_completes():
             assert controller.current_task_id == task_id_before_drop
 
             await controller.handle_utterance("where were we", router_class="session_query")
+            await controller.handle_utterance("yes go ahead")  # approve the local proposal
             await _wait_until(lambda: controller.current_task_id is None, timeout=5)
 
             spoken = [t for t, _ in speech]
