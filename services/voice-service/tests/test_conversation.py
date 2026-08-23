@@ -316,3 +316,64 @@ def test_session_snapshot_persists_and_restores_on_resume():
         await controller2.stop()
 
     asyncio.run(scenario())
+
+
+def test_on_task_state_changed_fires_when_an_agent_event_touches_a_task():
+    """A caller with no per-call has_active_task signal of its own (a live
+    Gemini session, unlike HaikuRouter.classify) needs some other way to
+    learn the state changed -- this is that hook."""
+
+    async def scenario():
+        client = FakeClient()
+        calls = []
+
+        async def on_task_state_changed():
+            calls.append(True)
+
+        controller = ConversationController(
+            client=client,
+            speak=lambda text, priority: asyncio.sleep(0),
+            ack=FakeAck(),
+            on_task_state_changed=on_task_state_changed,
+        )
+        await controller.start(session_id="s1", user_id="u1")
+
+        client.push(Ack(task_id="t1", text="Checking your calendar now."))
+        await _settle()
+
+        assert len(calls) == 1
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_on_task_state_changed_fires_on_resume_with_restored_tasks():
+    async def scenario():
+        store = InMemorySessionStore()
+        client = FakeClient()
+        controller, _ = _controller(client)
+        controller._session_store = store
+        await controller.start(session_id="s1", user_id="u1")
+        client.push(Ack(task_id="t1", text="Working on it."))
+        await _settle()
+        await controller.stop()
+
+        client2 = FakeClient()
+        calls = []
+
+        async def on_task_state_changed():
+            calls.append(True)
+
+        controller2 = ConversationController(
+            client=client2,
+            speak=lambda text, priority: asyncio.sleep(0),
+            ack=FakeAck(),
+            session_store=store,
+            on_task_state_changed=on_task_state_changed,
+        )
+        await controller2.start(session_id="s2", user_id="u1", resume=True)
+
+        assert calls == [True]
+        await controller2.stop()
+
+    asyncio.run(scenario())

@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.40",
     "google-genai>=2.18.1",
-    "livekit-agents[cartesia,deepgram,silero]>=1.6.8",
+    "livekit-agents[google]>=1.6.8",
     "pydantic-settings>=2",
     "redis>=8.1.0",
     "sentry-sdk>=2.67.1",

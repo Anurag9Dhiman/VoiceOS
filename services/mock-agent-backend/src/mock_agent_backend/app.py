@@ -79,7 +79,7 @@ async def voice_session(websocket: WebSocket) -> None:
             await _handle_fresh_session(start, send, incoming)
     finally:
         await reader_task
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.close()
 
 

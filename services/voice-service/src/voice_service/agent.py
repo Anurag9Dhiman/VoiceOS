@@ -1,33 +1,60 @@
 """LiveKit Agents entrypoint. Weeks 3-4 proved the raw STT/TTS round trip
-(EchoAgent, now retired); weeks 5-6 add the turn manager, the Haiku router,
-and the CollectiveOS bridge on top of it.
+(EchoAgent, now retired); weeks 5-6 added the turn manager, the Haiku
+router, and the CollectiveOS bridge on top of it. This revision replaces
+the cascaded Deepgram+Cartesia+text-router pipeline with Gemini Live
+(google.realtime.RealtimeModel) -- one full-duplex audio session standing
+in for STT+LLM+TTS all at once.
 
 This module is deliberately thin: routing decisions, contract event
 forwarding, and confirmation/interrupt handling all live in conversation.py
 (framework-agnostic, unit-tested against a real mock-agent-backend socket).
-RoutingAgent's only job is to hand LiveKit's final transcripts to the
-controller and let the controller's `speak` callback drive session.say() --
-with priority preemption and undelivered-utterance tracking wired to
-LiveKit's own interruption mechanism rather than reimplementing it.
+RoutingAgent's job is now a single tool, classify_utterance, that the live
+model is instructed to call on every turn -- the only reliable hook into a
+RealtimeModel-backed turn (llm_node, the old hook, is never invoked for a
+realtime session; LiveKit's own turn-completion logic short-circuits it).
+
+Two things this design has to work around, both confirmed against the
+installed livekit-agents/livekit-plugins-google source rather than assumed:
+
+1. Forced tool-calling (tool_choice) is not honored for Gemini Live through
+   LiveKit (per_response_tool_choice=False in RealtimeCapabilities) -- so
+   "always call classify_utterance first" is an instruction, not a
+   guarantee. ScriptedSpeechGuard + a reactive session.interrupt() are the
+   safety net, not a hard gate.
+2. session.say() requires RealtimeCapabilities.supports_say, which is False
+   for this plugin -- so raw_speak drives session.generate_reply(instructions=...)
+   instead, which (usefully) returns the same SpeechHandle shape say() does,
+   so turn_manager.py's undelivered-utterance tracking needed no changes.
+
+The classify_utterance tool asks the model for its own rendition of the
+utterance too (a `transcript` argument), since a RealtimeModel session has
+no discrete finalized-transcript step of its own for code to read the way
+the old STT pipeline did. Where possible this is overridden by a higher-
+fidelity source: Gemini Live's own input transcription, surfaced as
+AgentSession's "conversation_item_added" events, is captured into
+_latest_user_transcript and preferred over the model-authored one whenever
+it's available for the same turn.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from collections.abc import AsyncIterable
+from dataclasses import dataclass
 
 from livekit.agents import (
     Agent,
     AgentSession,
+    ConversationItemAddedEvent,
     JobContext,
     MetricsCollectedEvent,
+    RunContext,
     WorkerOptions,
     cli,
+    function_tool,
     metrics,
 )
-from livekit.agents.llm import ChatContext
-from livekit.plugins import cartesia, deepgram, silero
+from livekit.plugins import google
 
 from .ack import AckGenerator
 from .config import Settings
@@ -36,7 +63,7 @@ from .entity_stack import EntityStack
 from .latency import LatencyAggregator
 from .llm_provider import make_llm_client
 from .resilient_client import ReconnectingCollectiveOSClient
-from .router import HaikuRouter
+from .router import _ROUTER_CLASSES, _SYSTEM_PROMPT
 from .session_store import InMemorySessionStore, RedisSessionStore
 from .speech_composer import SpeechComposer
 from .turn_manager import TurnManagerSettings, UndeliveredTracker
@@ -45,32 +72,124 @@ logger = logging.getLogger("voice_service.agent")
 
 TURN_MANAGER_SETTINGS = TurnManagerSettings()
 
+_INSTRUCTIONS = (
+    _SYSTEM_PROMPT
+    + "\n\nAlso include a `transcript` field: your best rendition of exactly "
+    "what the user said. After classifying: for small_talk and simple_lookup, "
+    "answer the user yourself, briefly. For every other category, say "
+    "nothing -- a separate system will respond on CollectiveOS's behalf."
+)
+
+CLASSIFY_UTTERANCE_SCHEMA = {
+    "name": "classify_utterance",
+    "description": "Record the router classification and transcript for the utterance.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "router_class": {"type": "string", "enum": list(_ROUTER_CLASSES)},
+            "transcript": {
+                "type": "string",
+                "description": "Your best rendition of exactly what the user said.",
+            },
+        },
+        "required": ["router_class", "transcript"],
+    },
+}
+
+_LOCAL_ANSWER_CLASSES = ("small_talk", "simple_lookup")
+
+
+@dataclass
+class ScriptedSpeechGuard:
+    """Set around every CollectiveOS-driven raw_speak() call. A scripted
+    line is narration, not a real user turn -- if the model tries to run
+    classify_utterance against its own scripted speech (plausible, since
+    tool_choice isn't enforced), this short-circuits it instead of
+    forwarding a phantom utterance to ConversationController."""
+
+    speaking: bool = False
+
+
+@dataclass
+class _LatestUserTranscript:
+    """Gemini Live's own input transcription, captured from AgentSession's
+    conversation_item_added events -- higher fidelity than the transcript
+    the model self-reports as a classify_utterance argument, since it's the
+    provider's own speech recognition rather than the model's paraphrase.
+    Used when available; the tool argument is the fallback."""
+
+    text: str | None = None
+
+
+@dataclass
+class _AgentRef:
+    """Breaks a construction-order cycle: ConversationController needs an
+    on_task_state_changed callback at construction time, but that callback
+    needs to call RoutingAgent.update_instructions(), and RoutingAgent needs
+    the controller passed into its own constructor. Set once RoutingAgent
+    is actually built; the callback no-ops before then (the receive loop
+    can start, and therefore call it, before session.start() runs)."""
+
+    agent: RoutingAgent | None = None
+
+
+def _context_instructions(current_task_id: str | None, waiting_reason: str | None) -> str:
+    """The old HaikuRouter.classify() got has_active_task fresh on every
+    call; a live session's instructions are static unless something pushes
+    updates, so this is that something -- without it, confirmation_reply
+    ("yes go ahead") has no signal that a confirmation is even pending and
+    the model has nothing to go on."""
+    if current_task_id is None:
+        context = "There is no in-flight task right now."
+    elif waiting_reason == "user_confirm":
+        context = "There is an in-flight task awaiting the user's confirmation reply right now."
+    elif waiting_reason == "user_clarify":
+        context = "There is an in-flight task awaiting the user's clarification right now."
+    else:
+        context = "There is an in-flight task running right now, not yet awaiting a reply."
+    return _INSTRUCTIONS + "\n\n" + context
+
 
 class RoutingAgent(Agent):
-    """No LLM configured. llm_node hands the final transcript to the
-    ConversationController and yields nothing -- the controller speaks
-    everything (instant acks, forwarded CollectiveOS events) out of band
-    via the `speak` callback, not through the turn-based reply pipeline."""
+    """No text LLM configured -- Gemini Live is the entire audio pipeline.
+    classify_utterance is the only reliable per-turn hook into a
+    RealtimeModel session; everything downstream of a classification is a
+    lookup table (ack.py) or a protocol-following forward (conversation.py),
+    exactly as before."""
 
-    def __init__(self, controller: ConversationController) -> None:
-        super().__init__(instructions="Route utterances; never reply directly.")
+    def __init__(
+        self,
+        controller: ConversationController,
+        guard: ScriptedSpeechGuard,
+        latest_transcript: _LatestUserTranscript,
+    ) -> None:
+        super().__init__(instructions=_INSTRUCTIONS)
         self._controller = controller
+        self._guard = guard
+        self._latest_transcript = latest_transcript
 
-    async def llm_node(
-        self, chat_ctx: ChatContext, tools, model_settings
-    ) -> AsyncIterable[str]:
-        last_user = next(
-            (m for m in reversed(chat_ctx.messages()) if m.role == "user"),
-            None,
-        )
-        text = last_user.text_content if last_user else ""
-        if text:
-            await self._controller.handle_utterance(text)
-        return
-        yield  # pragma: no cover -- makes this an async generator
+    @function_tool(raw_schema=CLASSIFY_UTTERANCE_SCHEMA)
+    async def classify_utterance(self, raw_arguments: dict[str, object], ctx: RunContext) -> str:
+        if self._guard.speaking:
+            return "That was your own scripted line, not a user turn. Ignore it."
+
+        router_class = raw_arguments.get("router_class")
+        transcript = self._latest_transcript.text or raw_arguments.get("transcript") or ""
+
+        await self._controller.handle_utterance(str(transcript), router_class=router_class)  # type: ignore[arg-type]
+
+        if router_class in _LOCAL_ANSWER_CLASSES:
+            return "Go ahead and answer now, briefly."
+
+        await ctx.session.interrupt()
+        return "Stay silent. A separate system will respond on CollectiveOS's behalf."
 
 
 def _record_metric(aggregator: LatencyAggregator, metric: object) -> None:
+    # STTMetrics/EOUMetrics/TTSMetrics never fire for a RealtimeModel
+    # session (no separate STT/TTS stages to emit them from) -- left in
+    # place rather than guessed-at, pending live verification of whatever
+    # metric types (if any) RealtimeModel sessions actually emit.
     if isinstance(metric, metrics.STTMetrics):
         aggregator.record("stt.duration", metric.duration)
     elif isinstance(metric, metrics.EOUMetrics):
@@ -79,9 +198,22 @@ def _record_metric(aggregator: LatencyAggregator, metric: object) -> None:
         aggregator.record("tts.ttfb", metric.ttfb)
 
 
-def _make_speech_composer(session: AgentSession, tracker: UndeliveredTracker) -> SpeechComposer:
+def _make_speech_composer(
+    session: AgentSession, tracker: UndeliveredTracker, guard: ScriptedSpeechGuard
+) -> SpeechComposer:
     async def raw_speak(text: str) -> object:
-        handle = session.say(text)
+        guard.speaking = True
+        try:
+            handle = session.generate_reply(
+                instructions=(
+                    "Say exactly the following to the user, verbatim, with no "
+                    f"additions, no rephrasing, no extra commentary: {text!r}"
+                ),
+                tool_choice="none",
+                allow_interruptions=TURN_MANAGER_SETTINGS.allow_interruptions,
+            )
+        finally:
+            guard.speaking = False
         tracker.track(handle, text)
         return handle
 
@@ -99,16 +231,27 @@ async def entrypoint(ctx: JobContext) -> None:
     settings = Settings()
     aggregator = LatencyAggregator()
     tracker = UndeliveredTracker()
+    guard = ScriptedSpeechGuard()
+    latest_transcript = _LatestUserTranscript()
 
     session = AgentSession(
-        stt=deepgram.STT(api_key=settings.deepgram_api_key),
-        tts=cartesia.TTS(api_key=settings.cartesia_api_key),
-        vad=silero.VAD.load(),
-        **TURN_MANAGER_SETTINGS.as_session_kwargs(),
+        llm=google.realtime.RealtimeModel(
+            api_key=settings.google_api_key,
+            model=settings.gemini_live_model,
+            **TURN_MANAGER_SETTINGS.as_realtime_model_kwargs(),
+        ),
     )
 
     llm_client = make_llm_client(settings)
-    composer = _make_speech_composer(session, tracker)
+    composer = _make_speech_composer(session, tracker, guard)
+    agent_ref = _AgentRef()
+
+    async def _on_task_state_changed() -> None:
+        if agent_ref.agent is None:
+            return
+        await agent_ref.agent.update_instructions(
+            _context_instructions(controller.current_task_id, controller.waiting_reason)
+        )
 
     if settings.redis_url:
         session_store = RedisSessionStore.from_url(settings.redis_url)
@@ -118,10 +261,10 @@ async def entrypoint(ctx: JobContext) -> None:
     controller = ConversationController(
         client=ReconnectingCollectiveOSClient(settings.collectiveos_ws_url),
         speak=composer.speak,
-        router=HaikuRouter(client=llm_client),
         ack=AckGenerator(client=llm_client),
         entities=EntityStack(),
         session_store=session_store,
+        on_task_state_changed=_on_task_state_changed,
     )
 
     @session.on("metrics_collected")
@@ -129,6 +272,13 @@ async def entrypoint(ctx: JobContext) -> None:
         metrics.log_metrics(ev.metrics)
         _record_metric(aggregator, ev.metrics)
         logger.info(aggregator.summary_line())
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev: ConversationItemAddedEvent) -> None:
+        if ev.item.role == "user":
+            text = ev.item.text_content
+            if text:
+                latest_transcript.text = text
 
     await ctx.connect()
     # resume=False: real resume-detection needs a signal from the call setup
@@ -142,14 +292,16 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_stop_controller)
 
-    await session.start(agent=RoutingAgent(controller), room=ctx.room)
+    routing_agent = RoutingAgent(controller, guard, latest_transcript)
+    agent_ref.agent = routing_agent
+    await session.start(agent=routing_agent, room=ctx.room)
 
 
 def main() -> None:
     # Read SENTRY_DSN straight from the environment rather than through
-    # Settings(): Settings requires all five speech-plugin keys too, and
-    # eagerly constructing it here would reintroduce the exact bug already
-    # fixed once -- `voice-service --help` failing with no keys set.
+    # Settings(): Settings requires GOOGLE_API_KEY too, and eagerly
+    # constructing it here would reintroduce the exact bug already fixed
+    # once -- `voice-service --help` failing with no keys set.
     sentry_dsn = os.environ.get("SENTRY_DSN")
     if sentry_dsn:
         import sentry_sdk

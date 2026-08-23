@@ -89,6 +89,7 @@ class ConversationController:
         entities: EntityStack | None = None,
         session_store: SessionStore | None = None,
         rate_limiter: RateLimiter | None = None,
+        on_task_state_changed: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._client = client
         self._speak = speak
@@ -97,6 +98,12 @@ class ConversationController:
         self._entities = entities or EntityStack()
         self._session_store = session_store or InMemorySessionStore()
         self._rate_limiter = rate_limiter or InMemoryRateLimiter()
+        # Optional: notified whenever current_task_id/waiting_reason may have
+        # changed, so a caller with no other way to observe this state (e.g.
+        # a Gemini Live session, which has no per-call has_active_task
+        # argument the way HaikuRouter.classify does) can push it in as
+        # updated instructions instead.
+        self._on_task_state_changed = on_task_state_changed
 
         self._session_id: str | None = None
         self._user_id: str | None = None
@@ -137,6 +144,8 @@ class ConversationController:
                 self._entities.restore(snapshot.entity_stack)
                 for task_id in snapshot.active_task_ids:
                     self._touch_task(task_id)
+                if snapshot.active_task_ids and self._on_task_state_changed is not None:
+                    await self._on_task_state_changed()
 
         await self._client.connect(session_id=session_id, user_id=user_id, resume=resume)
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -274,3 +283,5 @@ class ConversationController:
             logger.warning("unhandled agent event type %r", type(event).__name__)
 
         await self._persist_session()
+        if self._on_task_state_changed is not None:
+            await self._on_task_state_changed()
