@@ -64,10 +64,12 @@ class Settings(BaseSettings):
         default="ws://localhost:8000/v1/ws", validation_alias="COLLECTIVEOS_WS_URL"
     )
 
-    # None -> session state (active tasks, entity stack) lives in-process
-    # only, lost on restart. Set to use Redis (plan sec. 6); RedisSessionStore
-    # is structurally complete but unverified -- no Redis instance exists in
-    # this environment.
+    # None -> session state (active tasks, entity stack) AND per-user rate
+    # limiting both live in-process only, lost on restart / not shared
+    # across workers. Set to back both with Redis instead (RedisSessionStore,
+    # RedisRateLimiter -- see agent.py's entrypoint(), which switches both
+    # on this one setting together; verified live against a real Redis
+    # instance, see test_redis_session_store.py / test_redis_rate_limiter.py).
     redis_url: str | None = Field(default=None, validation_alias="REDIS_URL")
 
     # The session stays silent and takes no action at all until this phrase

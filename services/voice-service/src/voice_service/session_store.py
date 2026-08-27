@@ -44,9 +44,8 @@ class InMemorySessionStore:
 
 
 class RedisSessionStore:
-    """One JSON blob per user. Structurally complete but unverified live --
-    no Redis instance exists in this environment; see voice-service/README.md.
-    """
+    """One JSON blob per user. Verified live against a real Redis instance --
+    see tests/test_redis_session_store.py."""
 
     def __init__(self, redis_client: object, *, key_prefix: str = "voice_session:") -> None:
         self._redis = redis_client

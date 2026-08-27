@@ -110,7 +110,7 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (112 tests, all green): the two load-bearing
+Unit- and integration-tested (122 tests, all green): the two load-bearing
 `RealtimeCapabilities` assumptions the Gemini Live design depends on
 (`supports_say`/`per_response_tool_choice`, both `False`, checked directly
 against the installed `livekit-plugins-google`, zero network),
@@ -129,7 +129,11 @@ sentence-initial capitalized words as entities, session snapshot/restore,
 the speech composer's priority and one-breath logic, the router eval
 harness's scoring/reporting (not the model's actual judgment — see below),
 the reconnect wrapper's backoff/give-up logic against a fake transport, the
-rate limiter's token-bucket math, the Gemini adapter's request/response
+rate limiter's token-bucket math, `RedisSessionStore`/`RedisRateLimiter`
+against a real local Redis instance (round-trip, overwrite, cross-instance
+sharing, and — for the rate limiter — real TTL-driven window expiry, not a
+mocked clock; skipped automatically if no Redis is reachable), the Gemini
+adapter's request/response
 translation against real `google-genai` types (constructed directly, no
 network) *and* that `HaikuRouter`/`AckGenerator` work against it completely
 unmodified, and all three reference scenarios *plus* an unexpected mid-task
@@ -174,8 +178,6 @@ Live migration specifically):
   text-only proxy, decoupled from the live `classify_utterance` tool-call
   path, since there's no way to eval the live model's spoken-utterance
   judgment offline without real audio
-- `RedisSessionStore` / `RedisRateLimiter` — structurally complete, no
-  Redis instance exists here to run either against
 - That Sentry actually receives an event — `SENTRY_DSN` unset here means
   `sentry_sdk.init()` is never called at all; the wiring is one `if` away
   from live, not tested end to end
