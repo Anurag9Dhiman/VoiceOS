@@ -73,10 +73,10 @@ from .conversation import ConversationController
 from .entity_stack import EntityStack
 from .latency import LatencyAggregator
 from .llm_provider import make_llm_client
-from .rate_limiter import InMemoryRateLimiter, RedisRateLimiter
+from .rate_limiter import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
 from .resilient_client import ReconnectingCollectiveOSClient
 from .router import _ROUTER_CLASSES, _SYSTEM_PROMPT
-from .session_store import InMemorySessionStore, RedisSessionStore
+from .session_store import InMemorySessionStore, RedisSessionStore, SessionStore
 from .speech_composer import SpeechComposer
 from .turn_manager import TurnManagerSettings, UndeliveredTracker
 
@@ -289,6 +289,20 @@ def _make_speech_composer(
     )
 
 
+def _build_stores(settings: Settings) -> tuple[SessionStore, RateLimiter]:
+    """Split out of entrypoint() so this branch -- the entire reason
+    REDIS_URL exists -- is unit-testable on its own. RedisRateLimiter was
+    once implemented but never actually reached this branch (only the
+    session store did); this split makes that specific regression easy to
+    catch again."""
+    if settings.redis_url:
+        return (
+            RedisSessionStore.from_url(settings.redis_url),
+            RedisRateLimiter.from_url(settings.redis_url),
+        )
+    return InMemorySessionStore(), InMemoryRateLimiter()
+
+
 async def entrypoint(ctx: JobContext) -> None:
     settings = Settings()
     aggregator = LatencyAggregator()
@@ -316,12 +330,7 @@ async def entrypoint(ctx: JobContext) -> None:
             _context_instructions(controller.current_task_id, controller.waiting_reason)
         )
 
-    if settings.redis_url:
-        session_store = RedisSessionStore.from_url(settings.redis_url)
-        rate_limiter = RedisRateLimiter.from_url(settings.redis_url)
-    else:
-        session_store = InMemorySessionStore()
-        rate_limiter = InMemoryRateLimiter()
+    session_store, rate_limiter = _build_stores(settings)
 
     controller = ConversationController(
         client=ReconnectingCollectiveOSClient(settings.collectiveos_ws_url),
@@ -365,16 +374,23 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(agent=routing_agent, room=ctx.room)
 
 
-def main() -> None:
-    # Read SENTRY_DSN straight from the environment rather than through
-    # Settings(): Settings requires GOOGLE_API_KEY too, and eagerly
-    # constructing it here would reintroduce the exact bug already fixed
-    # once -- `voice-service --help` failing with no keys set.
+def _init_sentry() -> None:
+    """Read SENTRY_DSN straight from the environment rather than through
+    Settings(): Settings requires GOOGLE_API_KEY too, and eagerly
+    constructing it here would reintroduce the exact bug already fixed
+    once -- `voice-service --help` failing with no keys set.
+
+    Split out of main() so this branch is unit-testable without also
+    invoking cli.run_app()."""
     sentry_dsn = os.environ.get("SENTRY_DSN")
     if sentry_dsn:
         import sentry_sdk
 
         sentry_sdk.init(dsn=sentry_dsn, traces_sample_rate=0.1)
+
+
+def main() -> None:
+    _init_sentry()
 
     # ws_url/api_key/api_secret are left unset here: WorkerOptions already
     # falls back to the LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET env
