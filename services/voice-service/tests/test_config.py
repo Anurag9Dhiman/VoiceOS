@@ -62,6 +62,26 @@ def test_wake_word_is_overridable(monkeypatch):
     assert settings.wake_word == "computer"
 
 
+def test_sleep_word_defaults_to_voiceos_go_to_sleep(monkeypatch):
+    _speech_keys(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "gm_key")
+    monkeypatch.delenv("SLEEP_WORD", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.sleep_word == "voiceos go to sleep"
+
+
+def test_sleep_word_is_overridable(monkeypatch):
+    _speech_keys(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "gm_key")
+    monkeypatch.setenv("SLEEP_WORD", "computer stop listening")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.sleep_word == "computer stop listening"
+
+
 def test_settings_fail_fast_when_google_api_key_missing(monkeypatch):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "gm_key")  # satisfy the LLM-key requirement
