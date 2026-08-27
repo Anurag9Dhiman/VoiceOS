@@ -10,6 +10,18 @@ Changes to this contract after v1 must be **additive only** (new optional
 fields, new enum values) to avoid breaking whichever side didn't change —
 consistent with the plan's "strictly additive" schema rule for the DB side.
 
+## Relationship to MCP
+
+CollectiveOS uses MCP (Model Context Protocol) internally to call its own
+tool backends (calendar, tasks, connectors) as part of its reasoning loop —
+that's the standard, intended use of MCP: agent-to-tool-server, not
+inter-service routing. This is entirely on CollectiveOS's side of the seam
+and invisible from here: this contract only ever carries the events listed
+below, regardless of what CollectiveOS uses internally to actually execute
+a task. Nothing about MCP changes this contract, and this contract's own
+"additive only" rule is exactly what keeps it that way as CollectiveOS's
+internals evolve.
+
 ## Transport
 
 One JSON-over-WebSocket connection per voice session. Every message is a
