@@ -115,7 +115,7 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (126 tests, all green): the two load-bearing
+Unit- and integration-tested (129 tests, all green): the two load-bearing
 `RealtimeCapabilities` assumptions the Gemini Live design depends on
 (`supports_say`/`per_response_tool_choice`, both `False`, checked directly
 against the installed `livekit-plugins-google`, zero network),
@@ -140,7 +140,11 @@ sharing, and — for the rate limiter — real TTL-driven window expiry, not a
 mocked clock; skipped automatically if no Redis is reachable),
 `_build_stores`'s REDIS_URL branch (the regression that once left
 `RedisRateLimiter` unwired even with Redis configured), the Sentry
-wiring's real capture pipeline against a substituted transport, the Gemini
+wiring's real capture pipeline against a substituted transport,
+`TurnManagerSettings.as_realtime_model_kwargs` (`min_interruption_duration`
+was dead config until wired to `RealtimeModel`'s `realtime_input_config`
+— confirmed both via `google-genai`'s own field docs and by opening a
+real Gemini Live session with it set, no rejection), the Gemini
 adapter's request/response
 translation against real `google-genai` types (constructed directly, no
 network) *and* that `HaikuRouter`/`AckGenerator` work against it completely
