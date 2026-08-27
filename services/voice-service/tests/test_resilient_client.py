@@ -187,3 +187,47 @@ def test_send_failures_are_not_retried():
         assert fixture.connect_calls == 1  # send() never triggers a reconnect
 
     asyncio.run(scenario())
+
+
+def test_send_before_connect_raises():
+    async def scenario():
+        client = ReconnectingCollectiveOSClient("ws://x", base_delay=0.001)
+
+        with pytest.raises(RuntimeError, match="not connected"):
+            await client.send(SessionQuery(session_id="s1", query="anything"))
+
+    asyncio.run(scenario())
+
+
+def test_receive_loop_gives_up_when_every_reconnect_attempt_after_a_drop_fails():
+    """test_connect_gives_up_after_max_retries covers giving up on the
+    very first connect() -- this is the other place ReconnectFailed can
+    happen: a drop mid-stream where every subsequent reconnect attempt
+    also fails. The receive loop must end cleanly (not raise) rather than
+    retrying forever."""
+
+    async def scenario():
+        fixture = _Fixture()
+        fixture_first_batch = [Ack(task_id="t1", text="hello")]
+        # One batch for the initial successful connect, plus enough more
+        # for every reconnect attempt the factory will be asked to build
+        # a client for (even though each of those connect() calls fails).
+        client = ReconnectingCollectiveOSClient(
+            "ws://x",
+            client_factory=_factory(fixture, [fixture_first_batch, [], [], []]),
+            base_delay=0.001,
+            max_retries=2,
+        )
+        await client.connect(session_id="s1", user_id="u1", resume=False)
+
+        # Every reconnect attempt after the initial drop fails.
+        fixture.fail_first_n_connects = 100
+
+        received = []
+        async for event in client:
+            received.append(event)
+
+        assert [type(e).__name__ for e in received] == ["Ack"]
+        assert client.state == "failed"
+
+    asyncio.run(scenario())

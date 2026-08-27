@@ -85,3 +85,14 @@ def test_undelivered_tracker_marks_an_interrupted_reply_as_undelivered():
     handle.finish(interrupted=True)
 
     assert tracker.drain() == ["Moved the 9 o'clock to Thursday."]
+
+
+def test_high_priority_speech_calls_raw_interrupt_bound_to_session_interrupt():
+    """raw_interrupt's actual binding (await session.interrupt()) was
+    never exercised -- SpeechComposer only calls it internally for
+    high-priority speech, and no test drove that path."""
+    composer, session, _, _ = _composer()
+
+    asyncio.run(composer.speak("Shall I go ahead?", "high"))
+
+    assert session.interrupt_calls == 1

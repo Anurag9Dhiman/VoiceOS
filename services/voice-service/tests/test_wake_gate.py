@@ -103,3 +103,9 @@ def test_waits_forever_on_an_empty_never_ending_source_until_cancelled():
             pass
 
     asyncio.run(scenario())
+
+
+def test_build_wake_detector_returns_none_until_a_real_engine_is_wired_in():
+    from voice_service.agent import _build_wake_detector
+
+    assert _build_wake_detector() is None

@@ -134,7 +134,11 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (133 tests, all green): the two load-bearing
+Unit- and integration-tested (155 tests, all green — 93% statement
+coverage; every remaining uncovered line is `entrypoint()`/`main()`/the
+router-eval CLI or `wake_gate.py`'s real audio adapter, all of which need
+live credentials or a real room to exercise, not more unit tests): the
+two load-bearing
 `RealtimeCapabilities` assumptions the Gemini Live design depends on
 (`supports_say`/`per_response_tool_choice`, both `False`, checked directly
 against the installed `livekit-plugins-google`, zero network),
