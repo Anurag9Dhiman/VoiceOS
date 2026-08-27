@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     # instructions/tool updates don't apply until the next session (the
     # plugin sets mutable_instructions=False for any "3.1" model), which
     # would break generate_reply(instructions=...)-driven speech entirely.
+    #
+    # There is no "-latest" alias for the Live API (unlike gemini_model
+    # below), so this has to be a literal dated string -- checked
+    # 2026-08-27 against a proposed "gemini-3.6-flash-live-001": that
+    # model does not exist (real API returns a 1008 policy-violation
+    # error, "not found ... or not supported for bidiGenerateContent").
+    # Don't swap this without opening a real session against it first --
+    # the installed plugin's mutable_instructions check is just
+    # `"3.1" not in model`, not real capability detection, so it can't
+    # tell you a new model is safe; only a live session can.
     gemini_live_model: str = Field(
         default="gemini-2.5-flash-native-audio-preview-12-2025",
         validation_alias="GEMINI_LIVE_MODEL",
@@ -48,6 +58,10 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     gemini_api_key: str | None = Field(default=None, validation_alias="GEMINI_API_KEY")
+    # "-latest" is an alias Google keeps pointed at their current
+    # recommended flash model -- deliberately not pinned to a dated
+    # string like gemini_live_model above has to be, so this one never
+    # needs a manual bump when a specific dated model gets deprecated.
     gemini_model: str = Field(default="gemini-flash-latest", validation_alias="GEMINI_MODEL")
 
     # Explicit override for when both keys happen to be set. Unset means

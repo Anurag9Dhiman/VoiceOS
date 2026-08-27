@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 
 from anthropic import AsyncAnthropic
+from langsmith import traceable
 from voice_contract import RouterClass
 
 from .router import DEFAULT_MODEL, MessagesClient
@@ -47,6 +48,7 @@ class AckGenerator:
                 return reply
         return _SMALL_TALK_FALLBACK
 
+    @traceable(name="simple_lookup_answer", run_type="llm")
     async def _simple_lookup_answer(self, text: str) -> str:
         response = await self._client.create(
             model=self._model,
