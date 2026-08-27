@@ -40,8 +40,10 @@ Settings.wake_word is heard (checked in code against the real transcript,
 not left to the model's own judgment -- the same lesson as
 ScriptedSpeechGuard/the reactive interrupt() above: instructions alone
 aren't enforced for this session type). WakeState.awake flips true the
-first time the phrase is found and stays true for the rest of the call --
-no re-sleep phrase, no repeating the wake word for follow-up turns.
+first time the phrase is found and stays true until Settings.sleep_word is
+heard, which flips it back -- also a code-level check, for the same
+reason. Neither phrase needs repeating for ordinary follow-up turns; only
+saying "go back to sleep" (or whatever sleep_word is configured to) does.
 """
 
 from __future__ import annotations
@@ -121,18 +123,29 @@ class ScriptedSpeechGuard:
 
 @dataclass
 class WakeState:
-    """True once the wake word has been heard; stays true for the rest of
-    the call. See module docstring for why this is a code-level check
-    against the real transcript, not an instruction the model follows."""
+    """True once the wake word has been heard; flips back to False once the
+    sleep word is heard. See module docstring for why this is a
+    code-level check against the real transcript, not an instruction the
+    model follows."""
 
     awake: bool = False
 
 
-def _after_wake_word(text: str, wake_word: str) -> str | None:
+def _after_phrase(text: str, phrase: str) -> str | None:
     """None if the phrase isn't present; otherwise whatever follows it, so
     "hey voiceos, clear my morning" wakes and hands off the remainder as
-    this turn's utterance in one breath, matching normal wake-word UX."""
-    match = re.search(r"\b" + re.escape(wake_word) + r"\b", text, re.IGNORECASE)
+    this turn's utterance in one breath, matching normal wake-word UX.
+    Used for both the wake word and the sleep word -- same matching rule
+    either way.
+
+    Matches word-by-word with optional punctuation/whitespace between each
+    word, not the phrase as one literal substring -- confirmed live that
+    Gemini Live's own transcription naturally inserts a comma when a
+    multi-word phrase is spoken as a direct address ("voiceos, go to
+    sleep"), which a literal-substring match would silently reject."""
+    words = phrase.split()
+    pattern = r"\b" + r"\b[\s,]*\b".join(re.escape(word) for word in words) + r"\b"
+    match = re.search(pattern, text, re.IGNORECASE)
     if match is None:
         return None
     # Strip the separator punctuation people naturally say after a wake
@@ -194,6 +207,7 @@ class RoutingAgent(Agent):
         latest_transcript: _LatestUserTranscript,
         wake_state: WakeState,
         wake_word: str,
+        sleep_word: str,
     ) -> None:
         super().__init__(instructions=_INSTRUCTIONS)
         self._controller = controller
@@ -201,6 +215,7 @@ class RoutingAgent(Agent):
         self._latest_transcript = latest_transcript
         self._wake_state = wake_state
         self._wake_word = wake_word
+        self._sleep_word = sleep_word
 
     @function_tool(raw_schema=CLASSIFY_UTTERANCE_SCHEMA)
     async def classify_utterance(self, raw_arguments: dict[str, object], ctx: RunContext) -> str:
@@ -211,13 +226,16 @@ class RoutingAgent(Agent):
         transcript = str(self._latest_transcript.text or raw_arguments.get("transcript") or "")
 
         if not self._wake_state.awake:
-            remainder = _after_wake_word(transcript, self._wake_word)
+            remainder = _after_phrase(transcript, self._wake_word)
             if remainder is None:
                 return "The wake word wasn't heard. Stay completely silent."
             self._wake_state.awake = True
             transcript = remainder
             if not transcript:
                 return "Just woke up. Acknowledge briefly that you're listening now."
+        elif _after_phrase(transcript, self._sleep_word) is not None:
+            self._wake_state.awake = False
+            return "Going back to sleep. Acknowledge briefly, then stay completely silent until woken again."
 
         await self._controller.handle_utterance(transcript, router_class=router_class)  # type: ignore[arg-type]
 
@@ -336,7 +354,9 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_stop_controller)
 
-    routing_agent = RoutingAgent(controller, guard, latest_transcript, wake_state, settings.wake_word)
+    routing_agent = RoutingAgent(
+        controller, guard, latest_transcript, wake_state, settings.wake_word, settings.sleep_word
+    )
     agent_ref.agent = routing_agent
     await session.start(agent=routing_agent, room=ctx.room)
 

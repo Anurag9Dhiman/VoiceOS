@@ -22,10 +22,15 @@ concern from the live audio path, which needs its own `GOOGLE_API_KEY`.
 
 0. The session stays completely silent until `Settings.wake_word` (default
    `"hey voiceos"`) is heard — checked in code against the real transcript
-   (`agent.py`'s `WakeState`/`_after_wake_word`), not left to the model's
+   (`agent.py`'s `WakeState`/`_after_phrase`), not left to the model's
    own judgment, for the same reason as step 1's reactive safety net below:
    instructions alone aren't enforced for this session type. Once awake,
-   stays awake for the rest of the call.
+   stays awake until `Settings.sleep_word` (default `"voiceos go to
+   sleep"` — deliberately branded and comma-free, since a bare generic
+   phrase risks matching normal conversation, and `_after_phrase` matches
+   word-by-word with optional punctuation between words, not the phrase
+   as one literal string, since Gemini Live's own transcription naturally
+   inserts a comma for a direct address like "voiceos, go to sleep").
 1. Gemini Live's own turn detection decides when the user's turn ends, then
    the model is instructed to call `classify_utterance` — the only reliable
    per-turn hook into a `RealtimeModel` session (`agent.py`'s
@@ -105,16 +110,17 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (105 tests, all green): the two load-bearing
+Unit- and integration-tested (112 tests, all green): the two load-bearing
 `RealtimeCapabilities` assumptions the Gemini Live design depends on
 (`supports_say`/`per_response_tool_choice`, both `False`, checked directly
 against the installed `livekit-plugins-google`, zero network),
 `classify_utterance`'s routing/interrupt/silence decisions and its
 `ScriptedSpeechGuard` recursion guard (`RoutingAgent` called directly, no
-real LiveKit session needed), the wake gate (`_after_wake_word`'s
-one-breath "wake word + command" parsing, case-insensitivity, and rejecting
-a longer word that merely contains the phrase; asleep/awake behavior end to
-end through `classify_utterance`), the `raw_speak`→`generate_reply`
+real LiveKit session needed), the wake/sleep gate (`_after_phrase`'s
+one-breath "wake word + command" parsing, case-insensitivity, tolerating a
+comma inserted between words, and rejecting a longer word that merely
+contains the phrase; full asleep→awake→asleep round trip through
+`classify_utterance`), the `raw_speak`→`generate_reply`
 binding, router tool-call parsing, ack templates, the full multi-task
 `ConversationController` state machine (including which task an
 unqualified follow-up targets when more than one is active), the entity
@@ -131,10 +137,11 @@ connection drop, end to end over a real socket.
 
 **Not verifiable in this environment** (in priority order for the Gemini
 Live migration specifically):
-- Whether real speech reliably contains the wake word cleanly enough for
-  `_after_wake_word`'s regex to catch it (accents, background noise,
-  Gemini Live's own transcription of the phrase itself) — the logic is
-  tested against plain text, not real audio
+- Whether real speech reliably contains the wake/sleep phrase cleanly
+  enough for `_after_phrase`'s regex to catch it (accents, background
+  noise) — the punctuation-tolerance fix was itself found live (Gemini
+  Live inserts a comma for "voiceos, go to sleep"), but the underlying
+  logic is otherwise only tested against text, not real audio
 - Whether the model actually calls `classify_utterance` on ~every turn,
   and whether audio leaks before `session.interrupt()` lands for the four
   CollectiveOS-forwarding classes — forced tool-choice isn't honored for

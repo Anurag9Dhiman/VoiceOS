@@ -72,9 +72,18 @@ class Settings(BaseSettings):
 
     # The session stays silent and takes no action at all until this phrase
     # is heard (case-insensitive, whole-phrase match) -- see agent.py's
-    # WakeState/_after_wake_word. Once heard, the session stays awake for
-    # the rest of the call; there's no re-sleep phrase.
+    # WakeState/_after_phrase. Once heard, the session stays awake until
+    # sleep_word is heard.
     wake_word: str = Field(default="hey voiceos", validation_alias="WAKE_WORD")
+
+    # Puts the session back to sleep (requires wake_word again). Default
+    # deliberately includes the brand name, not just "go to sleep" -- a
+    # bare generic phrase risks matching normal conversation ("I need to
+    # go to sleep early tonight, can you set a reminder") and putting the
+    # session to sleep mid-request. No internal punctuation, deliberately
+    # -- _after_phrase matches the literal phrase, and a transcript may or
+    # may not render a comma where a human would pause.
+    sleep_word: str = Field(default="voiceos go to sleep", validation_alias="SLEEP_WORD")
 
     @model_validator(mode="after")
     def _require_at_least_one_llm_key(self) -> Settings:
