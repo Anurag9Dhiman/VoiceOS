@@ -115,7 +115,7 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (122 tests, all green): the two load-bearing
+Unit- and integration-tested (126 tests, all green): the two load-bearing
 `RealtimeCapabilities` assumptions the Gemini Live design depends on
 (`supports_say`/`per_response_tool_choice`, both `False`, checked directly
 against the installed `livekit-plugins-google`, zero network),
@@ -137,7 +137,10 @@ the reconnect wrapper's backoff/give-up logic against a fake transport, the
 rate limiter's token-bucket math, `RedisSessionStore`/`RedisRateLimiter`
 against a real local Redis instance (round-trip, overwrite, cross-instance
 sharing, and — for the rate limiter — real TTL-driven window expiry, not a
-mocked clock; skipped automatically if no Redis is reachable), the Gemini
+mocked clock; skipped automatically if no Redis is reachable),
+`_build_stores`'s REDIS_URL branch (the regression that once left
+`RedisRateLimiter` unwired even with Redis configured), the Sentry
+wiring's real capture pipeline against a substituted transport, the Gemini
 adapter's request/response
 translation against real `google-genai` types (constructed directly, no
 network) *and* that `HaikuRouter`/`AckGenerator` work against it completely
@@ -183,9 +186,13 @@ Live migration specifically):
   text-only proxy, decoupled from the live `classify_utterance` tool-call
   path, since there's no way to eval the live model's spoken-utterance
   judgment offline without real audio
-- That Sentry actually receives an event — `SENTRY_DSN` unset here means
-  `sentry_sdk.init()` is never called at all; the wiring is one `if` away
-  from live, not tested end to end
+- That a real Sentry.io project actually receives an event — the SDK-level
+  pipeline itself (`sentry_sdk.init()` configured exactly as `_init_sentry()`
+  does, a real uncaught exception, real event serialization, a real
+  envelope) is now verified live by substituting sentry_sdk's own
+  `Transport` hook for a local recorder (see `tests/test_sentry_wiring.py`)
+  — only the final HTTPS call to Sentry's actual cloud endpoint is
+  unverified, which needs a real `SENTRY_DSN`
 - Real-world audio, latency numbers, and audio edge cases (noise, silence,
   crosstalk) — genuinely need hardware this environment doesn't have.
   Dropped-connection recovery specifically *is* now covered (see above) —
