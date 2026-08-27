@@ -19,14 +19,17 @@ that's the one an unqualified "wait, keep the 10am" should target. Session
 state (active task ids + the entity stack) is snapshotted to a SessionStore
 keyed by user_id, so a resumed connection can restore both.
 
-Universal local confirmation gate: every classified action -- small_talk,
-simple_lookup, new_intent, modify_inflight, session_query -- is proposed
-and held as a `_PendingAction` rather than acted on immediately; the next
-utterance is parsed as approve/reject via the same `_parse_decision` used
-for `confirmation_reply`, and only on approval does `_execute_action` run
-the original logic. `confirmation_reply` itself is exempt -- it's already
-the user's confirmation of a CollectiveOS-originated
-`confirmation_request`, so gating it again would be circular.
+Confirmation is risk-tiered, not blanket: every category acts immediately
+on classification. `small_talk`/`simple_lookup` never leave this process,
+so there's nothing to confirm. `new_intent`/`modify_inflight`/
+`session_query` forward straight to CollectiveOS, which is the system
+that actually knows the resulting risk_class -- its own
+`confirmation_request` (`risk_class: write`) already pauses for exactly
+the actions that need a human checkpoint, and never does for reads. A
+local pre-send gate here would either be redundant with that (for writes)
+or needless friction (for reads) -- an earlier revision of this file
+added exactly that blanket gate and it was deliberately removed once this
+became clear.
 """
 
 from __future__ import annotations
@@ -36,7 +39,6 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from voice_contract import (
@@ -88,39 +90,6 @@ def _parse_decision(text: str) -> tuple[Decision, str | None]:
     return "modify", text
 
 
-# confirmation_reply is deliberately absent: it's already the user's
-# confirmation of something CollectiveOS asked, so it's handled directly
-# in handle_utterance rather than gated a second time here.
-_LOCALLY_GATED_CLASSES = ("small_talk", "simple_lookup", "new_intent", "modify_inflight", "session_query")
-
-
-@dataclass
-class _PendingAction:
-    kind: str  # one of _LOCALLY_GATED_CLASSES
-    text: str
-    # Captured at proposal time for modify_inflight, so the eventual send
-    # targets the task that was actually current when this was proposed,
-    # not whatever happens to be current by the time the user approves.
-    target_task_id: str | None = None
-
-
-def _describe_action(router_class: str, text: str) -> str:
-    # Deliberately NOT "Shall I go ahead?" -- that's CollectiveOS's own
-    # write-confirmation phrasing (see mock_agent_backend/scenarios.py). A
-    # real user hearing the same question twice in a row, once for this
-    # local gate and again for CollectiveOS's own confirmation, wouldn't
-    # know which one they were answering.
-    if router_class in ("small_talk", "simple_lookup"):
-        return "I'm ready to reply. OK to proceed?"
-    if router_class == "new_intent":
-        return f"I'll ask CollectiveOS to handle: {text!r}. OK to proceed?"
-    if router_class == "modify_inflight":
-        return f"I'll send this as an update to the current task: {text!r}. OK to proceed?"
-    if router_class == "session_query":
-        return "I'll check on your session status. OK to proceed?"
-    return "I'm ready to proceed. OK to proceed?"
-
-
 class ConversationController:
     def __init__(
         self,
@@ -147,11 +116,6 @@ class ConversationController:
         # argument the way HaikuRouter.classify does) can push it in as
         # updated instructions instead.
         self._on_task_state_changed = on_task_state_changed
-        # Set by handle_utterance whenever a locally-gated action (see
-        # _LOCALLY_GATED_CLASSES) is proposed but not yet approved; the
-        # *next* utterance is consumed as the answer to it rather than
-        # being classified normally.
-        self._pending_action: _PendingAction | None = None
 
         self._session_id: str | None = None
         self._user_id: str | None = None
@@ -211,16 +175,10 @@ class ConversationController:
     async def handle_utterance(self, text: str, router_class: str | None = None) -> None:
         """router_class is normally decided by the Haiku router; tests may
         pass it directly to exercise the send-side logic without a live
-        Anthropic key. If a _pending_action is outstanding, router_class is
-        ignored entirely -- this utterance is consumed as the approve/reject
-        answer to it instead of being classified."""
+        Anthropic key."""
         if self._user_id is not None and not await self._rate_limiter.allow(self._user_id):
             logger.warning("rate limit exceeded for user %s, dropping: %r", self._user_id, text)
             await self._speak("Let's slow down a moment.", "low")
-            return
-
-        if self._pending_action is not None:
-            await self._resolve_pending_action(text)
             return
 
         router_class = router_class or await self._router.classify(
@@ -242,31 +200,15 @@ class ConversationController:
             )
             return
 
-        if router_class == "modify_inflight" and self.current_task_id is None:
-            logger.warning("modify_inflight with no active task, dropping: %r", text)
+        if router_class == "modify_inflight":
+            if self.current_task_id is None:
+                logger.warning("modify_inflight with no active task, dropping: %r", text)
+                return
+            await self._client.send(
+                Interrupt(session_id=self._session_id, target_task_id=self.current_task_id, text=text)
+            )
             return
 
-        if router_class in _LOCALLY_GATED_CLASSES:
-            target_task_id = self.current_task_id if router_class == "modify_inflight" else None
-            self._pending_action = _PendingAction(kind=router_class, text=text, target_task_id=target_task_id)
-            await self._speak(_describe_action(router_class, text), "high")
-            return
-
-        logger.warning("unhandled router_class %r for utterance %r", router_class, text)
-
-    async def _resolve_pending_action(self, text: str) -> None:
-        pending = self._pending_action
-        self._pending_action = None
-        assert pending is not None  # only called when set, just cleared above
-
-        decision, _ = _parse_decision(text)
-        if decision != "approve":
-            await self._speak("Okay, cancelled.", "low")
-            return
-
-        await self._execute_action(pending.kind, pending.text, target_task_id=pending.target_task_id)
-
-    async def _execute_action(self, router_class: str, text: str, *, target_task_id: str | None = None) -> None:
         if router_class in ("small_talk", "simple_lookup"):
             reply = await self._ack.instant_ack(router_class, text)
             await self._speak(reply, "low")
@@ -285,15 +227,11 @@ class ConversationController:
             )
             return
 
-        if router_class == "modify_inflight":
-            await self._client.send(
-                Interrupt(session_id=self._session_id, target_task_id=target_task_id, text=text)
-            )
-            return
-
         if router_class == "session_query":
             await self._client.send(SessionQuery(session_id=self._session_id, query=text))
             return
+
+        logger.warning("unhandled router_class %r for utterance %r", router_class, text)
 
     def _touch_task(self, task_id: str) -> None:
         if task_id in self._task_order:
