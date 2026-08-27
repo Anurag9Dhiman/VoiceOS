@@ -73,6 +73,7 @@ from .conversation import ConversationController
 from .entity_stack import EntityStack
 from .latency import LatencyAggregator
 from .llm_provider import make_llm_client
+from .rate_limiter import InMemoryRateLimiter, RedisRateLimiter
 from .resilient_client import ReconnectingCollectiveOSClient
 from .router import _ROUTER_CLASSES, _SYSTEM_PROMPT
 from .session_store import InMemorySessionStore, RedisSessionStore
@@ -317,8 +318,10 @@ async def entrypoint(ctx: JobContext) -> None:
 
     if settings.redis_url:
         session_store = RedisSessionStore.from_url(settings.redis_url)
+        rate_limiter = RedisRateLimiter.from_url(settings.redis_url)
     else:
         session_store = InMemorySessionStore()
+        rate_limiter = InMemoryRateLimiter()
 
     controller = ConversationController(
         client=ReconnectingCollectiveOSClient(settings.collectiveos_ws_url),
@@ -326,6 +329,7 @@ async def entrypoint(ctx: JobContext) -> None:
         ack=AckGenerator(client=llm_client),
         entities=EntityStack(),
         session_store=session_store,
+        rate_limiter=rate_limiter,
         on_task_state_changed=_on_task_state_changed,
     )
 

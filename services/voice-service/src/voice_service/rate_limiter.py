@@ -8,8 +8,8 @@ unbounded Anthropic bill or a runaway loop.
 
 Same shape as session_store.py on purpose: an in-memory default (fully
 tested, used unless REDIS_URL is set) and a Redis-backed variant for
-production (structurally complete, unverified live -- no Redis instance
-in this environment).
+production, verified live against a real Redis instance -- see
+tests/test_redis_rate_limiter.py.
 """
 
 from __future__ import annotations
@@ -63,9 +63,7 @@ class RedisRateLimiter:
     """Fixed-window counter over Redis (INCR + EXPIRE) rather than a true
     token bucket -- atomic without a Lua script, and window-edge burst
     slop is an acceptable tradeoff for what this protects against (a
-    runaway loop, not a precise API quota). Structurally complete,
-    unverified live -- see session_store.py's RedisSessionStore for the
-    same caveat.
+    runaway loop, not a precise API quota).
     """
 
     def __init__(
