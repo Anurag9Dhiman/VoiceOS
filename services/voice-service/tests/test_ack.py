@@ -41,3 +41,16 @@ def test_simple_lookup_uses_a_fast_model_call():
 
     assert reply == "It's Tuesday."
     assert fake.calls[0]["messages"][0]["content"] == "what day is it"
+
+
+def test_instant_ack_rejects_a_router_class_it_does_not_handle():
+    """new_intent/modify_inflight/etc. never reach AckGenerator in
+    practice (conversation.py only calls this for small_talk/simple_lookup)
+    -- this guard is what would catch a future caller getting that wrong."""
+    ack = AckGenerator(client=_FakeMessages(response=None))
+
+    try:
+        asyncio.run(ack.instant_ack("new_intent", "clear my morning"))
+        assert False, "expected a ValueError"
+    except ValueError as exc:
+        assert "new_intent" in str(exc)

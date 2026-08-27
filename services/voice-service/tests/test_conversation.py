@@ -3,8 +3,10 @@ import asyncio
 import pytest
 from voice_contract import (
     Ack,
+    ClarificationRequest,
     ConfirmationRequest,
     Done,
+    Error,
     Interrupt,
     Progress,
     SessionQuery,
@@ -375,5 +377,133 @@ def test_on_task_state_changed_fires_on_resume_with_restored_tasks():
 
         assert calls == [True]
         await controller2.stop()
+
+    asyncio.run(scenario())
+
+
+def test_clarification_request_sets_waiting_reason_and_speaks_high_priority():
+    async def scenario():
+        client = FakeClient()
+        controller, speak_calls = _controller(client)
+        await controller.start(session_id="s1", user_id="u1")
+
+        client.push(
+            ClarificationRequest(task_id="t1", speak="Which meeting did you mean?")
+        )
+        await _settle()
+
+        assert controller.current_task_id == "t1"
+        assert controller.waiting_reason == "user_clarify"
+        assert speak_calls == [("Which meeting did you mean?", "high")]
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_recoverable_error_speaks_but_keeps_the_task_active():
+    async def scenario():
+        client = FakeClient()
+        controller, speak_calls = _controller(client)
+        await controller.start(session_id="s1", user_id="u1")
+
+        client.push(Ack(task_id="t1", text="Starting."))
+        await _settle()
+        client.push(Error(task_id="t1", recoverable=True, speak="Retrying that step."))
+        await _settle()
+
+        assert speak_calls[-1] == ("Retrying that step.", "high")
+        assert controller.active_task_ids == ["t1"]  # not dropped -- recoverable
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_unrecoverable_error_speaks_and_drops_the_task():
+    async def scenario():
+        client = FakeClient()
+        controller, speak_calls = _controller(client)
+        await controller.start(session_id="s1", user_id="u1")
+
+        client.push(Ack(task_id="t1", text="Starting."))
+        await _settle()
+        client.push(Error(task_id="t1", recoverable=False, speak="That failed permanently."))
+        await _settle()
+
+        assert speak_calls[-1] == ("That failed permanently.", "high")
+        assert controller.active_task_ids == []  # dropped -- unrecoverable
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_an_unrecognized_agent_event_type_is_ignored_not_fatal():
+    """_handle_agent_event's fallback branch -- some future or malformed
+    event type must be logged and skipped, not crash the receive loop."""
+
+    async def scenario():
+        client = FakeClient()
+        controller, speak_calls = _controller(client)
+        await controller.start(session_id="s1", user_id="u1")
+
+        client.push(object())  # not any known AgentToVoiceEvent type
+        await _settle()
+        # The receive loop is still alive afterward -- a real event right
+        # after the unrecognized one is still processed normally.
+        client.push(Ack(task_id="t1", text="still working"))
+        await _settle()
+
+        assert speak_calls == [("still working", "low")]
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_confirmation_reply_with_no_active_task_is_dropped():
+    async def scenario():
+        client = FakeClient()
+        controller, _ = _controller(client, "confirmation_reply")
+        await controller.start(session_id="s1", user_id="u1")
+
+        await controller.handle_utterance("yes, go ahead")  # no task is active
+
+        assert client.sent == []  # nothing forwarded -- there's nothing to confirm
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_an_unrecognized_router_class_is_dropped_not_fatal():
+    async def scenario():
+        client = FakeClient()
+        controller, speak_calls = _controller(client, "some_future_category")
+        await controller.start(session_id="s1", user_id="u1")
+
+        await controller.handle_utterance("whatever this turns out to be")
+
+        assert client.sent == []
+        assert speak_calls == []
+        await controller.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stop_without_ever_starting_does_not_persist_a_session():
+    """_persist_session guards on self._user_id being set -- calling
+    stop() on a controller that never had start() called (no real call
+    ever connected) must not try to save a snapshot for a user that was
+    never identified."""
+
+    async def scenario():
+        store = InMemorySessionStore()
+        controller = ConversationController(
+            client=FakeClient(),
+            speak=lambda text, priority: asyncio.sleep(0),
+            ack=FakeAck(),
+            session_store=store,
+        )
+
+        await controller.stop()  # must not raise
+
+        assert await store.load("u1") is None
 
     asyncio.run(scenario())
