@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from anthropic import AsyncAnthropic
+from langsmith import traceable
 from voice_contract import RouterClass
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -76,6 +77,7 @@ class HaikuRouter:
         self._client = client or AsyncAnthropic().messages
         self._model = model
 
+    @traceable(name="router_classify", run_type="llm")
     async def classify(self, text: str, *, has_active_task: bool = False) -> RouterClass:
         context = (
             "There is currently an in-flight task awaiting the user's input."

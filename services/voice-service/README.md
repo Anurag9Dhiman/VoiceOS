@@ -265,7 +265,15 @@ call site defers to. `GEMINI_LIVE_MODEL` (the realtime audio model) defaults
 to `gemini-2.5-flash-native-audio-preview-12-2025`; `GEMINI_MODEL` (the
 separate plain-text model used by `ack.py`'s `simple_lookup` answer and
 `router_eval.py`) defaults to `gemini-flash-latest` — both independently
-overridable. `COLLECTIVEOS_WS_URL`
+overridable. `GEMINI_MODEL` deliberately stays on the `-latest` alias
+rather than a dated string: unlike the Live API, the plain
+`generate_content` API supports it, so it never needs a manual bump when
+Google deprecates a specific dated model. (Checked live 2026-08-27: a
+proposed `gemini-3.6-flash-live-001` for `GEMINI_LIVE_MODEL` doesn't
+exist — the real API returns a 1008 policy-violation error — while plain
+`gemini-3.6-flash` does exist and works; `GEMINI_LIVE_MODEL` stays on the
+`2.5` model until a real, live-verified `3.x` Live model name is
+confirmed. See `config.py`'s comment on `gemini_live_model`.) `COLLECTIVEOS_WS_URL`
 defaults to `ws://localhost:8000/v1/ws` — mock-agent-backend's own default
 port. `REDIS_URL` is optional; unset means session state and rate-limit
 counters are in-process only (lost on restart) rather than persisted to
@@ -276,6 +284,16 @@ for `voice-service dev`/`start` against a real room, not `console`.
 env vars set, and that has to keep being true as things get added, not
 just be true today. `WAKE_WORD` defaults to `"hey voiceos"` — the session
 takes no action on anything until it's heard; see "How a turn flows" step 0.
+
+`LANGCHAIN_TRACING_V2`/`LANGCHAIN_API_KEY` are optional and enable
+LangSmith tracing on `router.py`'s `classify` and `ack.py`'s
+`_simple_lookup_answer` (the two actual LLM-call boundaries, `@traceable`
+on both) — read directly by the `langsmith` package itself from the
+environment, not through `Settings()` or any init call in this codebase.
+Confirmed live that an invalid `LANGCHAIN_API_KEY` only logs a warning on
+the failed trace submission and doesn't affect the decorated call's
+actual return value — same fail-open shape as everything else optional
+here.
 
 **A version pin worth knowing about:** `google-genai` (every published
 version) requires `websockets<17.0`, which conflicted with the
