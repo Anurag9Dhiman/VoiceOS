@@ -70,6 +70,11 @@ concern from the live audio path, which needs its own `GOOGLE_API_KEY`.
    `small_talk`, that can never be risky at all). `confirmation_reply` is
    how the user answers CollectiveOS's real gate, and always forwards
    immediately via `_parse_decision`.
+
+   (This also retires the "richer confirmation UX — batched approval for a
+   string of low-risk actions" item from earlier planning: it assumed the
+   local blanket gate this section describes removing, so there's no
+   longer a local approval step left to batch.)
 4. Whatever CollectiveOS sends back is spoken via `speech_composer.py`
    (priority preemption, one-breath logging) → `agent.py`'s `speak`
    binding, which drives `session.generate_reply(instructions=...)`
