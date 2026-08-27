@@ -31,6 +31,25 @@ concern from the live audio path, which needs its own `GOOGLE_API_KEY`.
    word-by-word with optional punctuation between words, not the phrase
    as one literal string, since Gemini Live's own transcription naturally
    inserts a comma for a direct address like "voiceos, go to sleep").
+
+   Step 0's gate above decides whether to *act* on what's heard — but the
+   realtime Gemini Live session itself still opens and streams continuously
+   for the whole call regardless, the moment the call connects. `wake_gate.py`
+   is the other half: a `WakeWordDetector` Protocol plus a real
+   `LiveKitAudioFrameSource` adapter (confirmed against the installed
+   `livekit-rtc` API — `AudioStream.from_participant`,
+   `TrackSource.SOURCE_MICROPHONE`) for gating *when the expensive session
+   even opens* on a cheap local detector instead, the way an always-on
+   device like Alexa/Google Home works. `entrypoint()` already calls this
+   gate before constructing the realtime session (see
+   `_build_wake_detector()`) — it's just wired to `None` today, since no
+   on-device engine license or microphone hardware exists in this
+   environment to build and verify a real one against. Plugging in a real
+   detector (Porcupine or similar) is a one-line change to
+   `_build_wake_detector()`; nothing else in `entrypoint()` needs to
+   change. The gating logic itself (`wait_for_wake_word`) is fully unit
+   tested against a scripted frame source — only `LiveKitAudioFrameSource`
+   needs a real room and real audio to verify live.
 1. Gemini Live's own turn detection decides when the user's turn ends, then
    the model is instructed to call `classify_utterance` — the only reliable
    per-turn hook into a `RealtimeModel` session (`agent.py`'s
@@ -115,7 +134,7 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (129 tests, all green): the two load-bearing
+Unit- and integration-tested (133 tests, all green): the two load-bearing
 `RealtimeCapabilities` assumptions the Gemini Live design depends on
 (`supports_say`/`per_response_tool_choice`, both `False`, checked directly
 against the installed `livekit-plugins-google`, zero network),
@@ -201,6 +220,13 @@ Live migration specifically):
   crosstalk) — genuinely need hardware this environment doesn't have.
   Dropped-connection recovery specifically *is* now covered (see above) —
   that gap is closed, not just narrowed.
+- `wake_gate.py`'s `LiveKitAudioFrameSource` — the gating *decision*
+  (`wait_for_wake_word`) is fully unit tested; reading real microphone
+  frames from a real room via `rtc.AudioStream.from_participant` needs a
+  real room with a real participant publishing real audio to verify live.
+  No real `WakeWordDetector` is wired in either (`_build_wake_detector()`
+  returns `None`) — needs an on-device engine license (Porcupine or
+  similar) this environment doesn't have.
 
 **Out of reach from this repo entirely** (see
 [`/collectiveos-integration`](../../collectiveos-integration) at the repo

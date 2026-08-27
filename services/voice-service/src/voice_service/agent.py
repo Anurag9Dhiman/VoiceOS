@@ -79,6 +79,7 @@ from .router import _ROUTER_CLASSES, _SYSTEM_PROMPT
 from .session_store import InMemorySessionStore, RedisSessionStore, SessionStore
 from .speech_composer import SpeechComposer
 from .turn_manager import TurnManagerSettings, UndeliveredTracker
+from .wake_gate import LiveKitAudioFrameSource, WakeWordDetector, wait_for_wake_word
 
 logger = logging.getLogger("voice_service.agent")
 
@@ -289,6 +290,15 @@ def _make_speech_composer(
     )
 
 
+def _build_wake_detector() -> WakeWordDetector | None:
+    """None until a real on-device engine (Porcupine or similar) is
+    actually integrated -- this is the one line to change once one is.
+    See wake_gate.py's module docstring for why none is shipped here (no
+    mic hardware or vendor license in this environment to build and
+    verify one against)."""
+    return None
+
+
 def _build_stores(settings: Settings) -> tuple[SessionStore, RateLimiter]:
     """Split out of entrypoint() so this branch -- the entire reason
     REDIS_URL exists -- is unit-testable on its own. RedisRateLimiter was
@@ -305,6 +315,24 @@ def _build_stores(settings: Settings) -> tuple[SessionStore, RateLimiter]:
 
 async def entrypoint(ctx: JobContext) -> None:
     settings = Settings()
+
+    # Connect first (nothing below depends on room state until this
+    # point) so a configured wake detector can gate opening the
+    # expensive, continuously-streaming Gemini Live connection on local
+    # detection -- see wake_gate.py's module docstring. No behavior
+    # change today: _build_wake_detector() returns None, so this is a
+    # no-op and everything proceeds exactly as it always has.
+    await ctx.connect()
+    wake_detector = _build_wake_detector()
+    if wake_detector is not None:
+        participant = await ctx.wait_for_participant()
+        frames = LiveKitAudioFrameSource(
+            participant,
+            sample_rate=wake_detector.sample_rate,
+            frame_length=wake_detector.frame_length,
+        )
+        await wait_for_wake_word(frames, wake_detector)
+
     aggregator = LatencyAggregator()
     tracker = UndeliveredTracker()
     guard = ScriptedSpeechGuard()
@@ -355,7 +383,6 @@ async def entrypoint(ctx: JobContext) -> None:
             if text:
                 latest_transcript.text = text
 
-    await ctx.connect()
     # resume=False: real resume-detection needs a signal from the call setup
     # (room metadata / participant attributes carrying "this user has a
     # pending task") that doesn't exist yet -- that's an integration-time
