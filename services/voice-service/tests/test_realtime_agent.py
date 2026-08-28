@@ -16,12 +16,13 @@ from voice_service.agent import (
     ScriptedSpeechGuard,
     WakeState,
     _AgentRef,
-    _after_wake_word,
+    _after_phrase,
     _context_instructions,
     _LatestUserTranscript,
 )
 
 _WAKE_WORD = "hey voiceos"
+_SLEEP_WORD = "voiceos go to sleep"
 
 
 class _FakeController:
@@ -48,7 +49,7 @@ def _agent(*, awake: bool = True):
     guard = ScriptedSpeechGuard()
     latest = _LatestUserTranscript()
     wake_state = WakeState(awake=awake)
-    agent = RoutingAgent(controller, guard, latest, wake_state, _WAKE_WORD)
+    agent = RoutingAgent(controller, guard, latest, wake_state, _WAKE_WORD, _SLEEP_WORD)
     ctx = SimpleNamespace(session=_FakeSession())
     return agent, controller, guard, ctx
 
@@ -134,7 +135,12 @@ def test_agent_ref_holder_starts_empty_and_is_set_after_construction():
 
     controller = _FakeController()
     agent = RoutingAgent(
-        controller, ScriptedSpeechGuard(), _LatestUserTranscript(), WakeState(awake=True), _WAKE_WORD
+        controller,
+        ScriptedSpeechGuard(),
+        _LatestUserTranscript(),
+        WakeState(awake=True),
+        _WAKE_WORD,
+        _SLEEP_WORD,
     )
     ref.agent = agent
 
@@ -154,24 +160,37 @@ def test_latest_captured_transcript_overrides_the_model_supplied_one():
     assert controller.calls == [("the actual STT transcript", "new_intent")]
 
 
-def test_after_wake_word_returns_none_when_absent():
-    assert _after_wake_word("just talking normally", _WAKE_WORD) is None
+def test_after_phrase_returns_none_when_absent():
+    assert _after_phrase("just talking normally", _WAKE_WORD) is None
 
 
-def test_after_wake_word_returns_the_remainder_in_one_breath():
-    assert _after_wake_word("hey voiceos, clear my morning", _WAKE_WORD) == "clear my morning"
+def test_after_phrase_returns_the_remainder_in_one_breath():
+    assert _after_phrase("hey voiceos, clear my morning", _WAKE_WORD) == "clear my morning"
 
 
-def test_after_wake_word_is_case_insensitive():
-    assert _after_wake_word("HEY VOICEOS clear my morning", _WAKE_WORD) == "clear my morning"
+def test_after_phrase_is_case_insensitive():
+    assert _after_phrase("HEY VOICEOS clear my morning", _WAKE_WORD) == "clear my morning"
 
 
-def test_after_wake_word_returns_empty_string_for_the_phrase_alone():
-    assert _after_wake_word("hey voiceos", _WAKE_WORD) == ""
+def test_after_phrase_returns_empty_string_for_the_phrase_alone():
+    assert _after_phrase("hey voiceos", _WAKE_WORD) == ""
 
 
-def test_after_wake_word_rejects_a_longer_word_containing_the_phrase():
-    assert _after_wake_word("hey voiceostron activate", _WAKE_WORD) is None
+def test_after_phrase_rejects_a_longer_word_containing_the_phrase():
+    assert _after_phrase("hey voiceostron activate", _WAKE_WORD) is None
+
+
+def test_after_phrase_sleep_word_rejects_normal_conversation_containing_similar_words():
+    assert _after_phrase("I need to go to sleep early tonight", _SLEEP_WORD) is None
+
+
+def test_after_phrase_tolerates_a_comma_inserted_between_words():
+    """The exact failure found live: Gemini Live's own transcription
+    naturally inserts a comma when a multi-word phrase is spoken as a
+    direct address ("voiceos, go to sleep") -- a literal-substring match
+    would silently reject this and the sleep word would just never work."""
+    assert _after_phrase("voiceos, go to sleep now.", _SLEEP_WORD) == "now."
+    assert _after_phrase("hey, voiceos, clear my morning", _WAKE_WORD) == "clear my morning"
 
 
 def test_asleep_with_no_wake_word_stays_silent_and_never_calls_the_controller():
@@ -222,3 +241,52 @@ def test_already_awake_is_unaffected_by_the_wake_gate():
     )
 
     assert controller.calls == [("clear my morning", "new_intent")]
+
+
+def test_awake_and_sleep_word_heard_goes_back_to_sleep_without_calling_the_controller():
+    agent, controller, _, ctx = _agent(awake=True)
+
+    result = asyncio.run(
+        agent.classify_utterance(
+            {"router_class": "small_talk", "transcript": "voiceos go to sleep"}, ctx
+        )
+    )
+
+    assert agent._wake_state.awake is False
+    assert controller.calls == []
+    assert "sleep" in result.lower() or "silent" in result.lower()
+
+
+def test_after_going_back_to_sleep_a_plain_utterance_is_ignored_again():
+    agent, controller, _, ctx = _agent(awake=True)
+
+    asyncio.run(
+        agent.classify_utterance(
+            {"router_class": "small_talk", "transcript": "voiceos go to sleep"}, ctx
+        )
+    )
+    assert agent._wake_state.awake is False
+
+    result = asyncio.run(
+        agent.classify_utterance({"router_class": "new_intent", "transcript": "clear my morning"}, ctx)
+    )
+
+    assert "silent" in result.lower() or "wake" in result.lower()
+    assert controller.calls == []
+
+
+def test_asleep_ignores_the_sleep_word_itself_since_it_only_applies_while_awake():
+    """The sleep word only matters once awake -- while asleep, only the
+    wake word matters, and "voiceos go to sleep" doesn't happen to contain
+    the wake word "hey voiceos"."""
+    agent, controller, _, ctx = _agent(awake=False)
+
+    result = asyncio.run(
+        agent.classify_utterance(
+            {"router_class": "small_talk", "transcript": "voiceos go to sleep"}, ctx
+        )
+    )
+
+    assert agent._wake_state.awake is False
+    assert controller.calls == []
+    assert "silent" in result.lower() or "wake" in result.lower()

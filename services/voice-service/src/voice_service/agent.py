@@ -40,8 +40,10 @@ Settings.wake_word is heard (checked in code against the real transcript,
 not left to the model's own judgment -- the same lesson as
 ScriptedSpeechGuard/the reactive interrupt() above: instructions alone
 aren't enforced for this session type). WakeState.awake flips true the
-first time the phrase is found and stays true for the rest of the call --
-no re-sleep phrase, no repeating the wake word for follow-up turns.
+first time the phrase is found and stays true until Settings.sleep_word is
+heard, which flips it back -- also a code-level check, for the same
+reason. Neither phrase needs repeating for ordinary follow-up turns; only
+saying "go back to sleep" (or whatever sleep_word is configured to) does.
 """
 
 from __future__ import annotations
@@ -71,11 +73,13 @@ from .conversation import ConversationController
 from .entity_stack import EntityStack
 from .latency import LatencyAggregator
 from .llm_provider import make_llm_client
+from .rate_limiter import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
 from .resilient_client import ReconnectingCollectiveOSClient
 from .router import _ROUTER_CLASSES, _SYSTEM_PROMPT
-from .session_store import InMemorySessionStore, RedisSessionStore
+from .session_store import InMemorySessionStore, RedisSessionStore, SessionStore
 from .speech_composer import SpeechComposer
 from .turn_manager import TurnManagerSettings, UndeliveredTracker
+from .wake_gate import LiveKitAudioFrameSource, WakeWordDetector, wait_for_wake_word
 
 logger = logging.getLogger("voice_service.agent")
 
@@ -121,18 +125,29 @@ class ScriptedSpeechGuard:
 
 @dataclass
 class WakeState:
-    """True once the wake word has been heard; stays true for the rest of
-    the call. See module docstring for why this is a code-level check
-    against the real transcript, not an instruction the model follows."""
+    """True once the wake word has been heard; flips back to False once the
+    sleep word is heard. See module docstring for why this is a
+    code-level check against the real transcript, not an instruction the
+    model follows."""
 
     awake: bool = False
 
 
-def _after_wake_word(text: str, wake_word: str) -> str | None:
+def _after_phrase(text: str, phrase: str) -> str | None:
     """None if the phrase isn't present; otherwise whatever follows it, so
     "hey voiceos, clear my morning" wakes and hands off the remainder as
-    this turn's utterance in one breath, matching normal wake-word UX."""
-    match = re.search(r"\b" + re.escape(wake_word) + r"\b", text, re.IGNORECASE)
+    this turn's utterance in one breath, matching normal wake-word UX.
+    Used for both the wake word and the sleep word -- same matching rule
+    either way.
+
+    Matches word-by-word with optional punctuation/whitespace between each
+    word, not the phrase as one literal substring -- confirmed live that
+    Gemini Live's own transcription naturally inserts a comma when a
+    multi-word phrase is spoken as a direct address ("voiceos, go to
+    sleep"), which a literal-substring match would silently reject."""
+    words = phrase.split()
+    pattern = r"\b" + r"\b[\s,]*\b".join(re.escape(word) for word in words) + r"\b"
+    match = re.search(pattern, text, re.IGNORECASE)
     if match is None:
         return None
     # Strip the separator punctuation people naturally say after a wake
@@ -194,6 +209,7 @@ class RoutingAgent(Agent):
         latest_transcript: _LatestUserTranscript,
         wake_state: WakeState,
         wake_word: str,
+        sleep_word: str,
     ) -> None:
         super().__init__(instructions=_INSTRUCTIONS)
         self._controller = controller
@@ -201,6 +217,7 @@ class RoutingAgent(Agent):
         self._latest_transcript = latest_transcript
         self._wake_state = wake_state
         self._wake_word = wake_word
+        self._sleep_word = sleep_word
 
     @function_tool(raw_schema=CLASSIFY_UTTERANCE_SCHEMA)
     async def classify_utterance(self, raw_arguments: dict[str, object], ctx: RunContext) -> str:
@@ -211,13 +228,16 @@ class RoutingAgent(Agent):
         transcript = str(self._latest_transcript.text or raw_arguments.get("transcript") or "")
 
         if not self._wake_state.awake:
-            remainder = _after_wake_word(transcript, self._wake_word)
+            remainder = _after_phrase(transcript, self._wake_word)
             if remainder is None:
                 return "The wake word wasn't heard. Stay completely silent."
             self._wake_state.awake = True
             transcript = remainder
             if not transcript:
                 return "Just woke up. Acknowledge briefly that you're listening now."
+        elif _after_phrase(transcript, self._sleep_word) is not None:
+            self._wake_state.awake = False
+            return "Going back to sleep. Acknowledge briefly, then stay completely silent until woken again."
 
         await self._controller.handle_utterance(transcript, router_class=router_class)  # type: ignore[arg-type]
 
@@ -270,8 +290,49 @@ def _make_speech_composer(
     )
 
 
+def _build_wake_detector() -> WakeWordDetector | None:
+    """None until a real on-device engine (Porcupine or similar) is
+    actually integrated -- this is the one line to change once one is.
+    See wake_gate.py's module docstring for why none is shipped here (no
+    mic hardware or vendor license in this environment to build and
+    verify one against)."""
+    return None
+
+
+def _build_stores(settings: Settings) -> tuple[SessionStore, RateLimiter]:
+    """Split out of entrypoint() so this branch -- the entire reason
+    REDIS_URL exists -- is unit-testable on its own. RedisRateLimiter was
+    once implemented but never actually reached this branch (only the
+    session store did); this split makes that specific regression easy to
+    catch again."""
+    if settings.redis_url:
+        return (
+            RedisSessionStore.from_url(settings.redis_url),
+            RedisRateLimiter.from_url(settings.redis_url),
+        )
+    return InMemorySessionStore(), InMemoryRateLimiter()
+
+
 async def entrypoint(ctx: JobContext) -> None:
     settings = Settings()
+
+    # Connect first (nothing below depends on room state until this
+    # point) so a configured wake detector can gate opening the
+    # expensive, continuously-streaming Gemini Live connection on local
+    # detection -- see wake_gate.py's module docstring. No behavior
+    # change today: _build_wake_detector() returns None, so this is a
+    # no-op and everything proceeds exactly as it always has.
+    await ctx.connect()
+    wake_detector = _build_wake_detector()
+    if wake_detector is not None:
+        participant = await ctx.wait_for_participant()
+        frames = LiveKitAudioFrameSource(
+            participant,
+            sample_rate=wake_detector.sample_rate,
+            frame_length=wake_detector.frame_length,
+        )
+        await wait_for_wake_word(frames, wake_detector)
+
     aggregator = LatencyAggregator()
     tracker = UndeliveredTracker()
     guard = ScriptedSpeechGuard()
@@ -297,10 +358,7 @@ async def entrypoint(ctx: JobContext) -> None:
             _context_instructions(controller.current_task_id, controller.waiting_reason)
         )
 
-    if settings.redis_url:
-        session_store = RedisSessionStore.from_url(settings.redis_url)
-    else:
-        session_store = InMemorySessionStore()
+    session_store, rate_limiter = _build_stores(settings)
 
     controller = ConversationController(
         client=ReconnectingCollectiveOSClient(settings.collectiveos_ws_url),
@@ -308,6 +366,7 @@ async def entrypoint(ctx: JobContext) -> None:
         ack=AckGenerator(client=llm_client),
         entities=EntityStack(),
         session_store=session_store,
+        rate_limiter=rate_limiter,
         on_task_state_changed=_on_task_state_changed,
     )
 
@@ -324,7 +383,6 @@ async def entrypoint(ctx: JobContext) -> None:
             if text:
                 latest_transcript.text = text
 
-    await ctx.connect()
     # resume=False: real resume-detection needs a signal from the call setup
     # (room metadata / participant attributes carrying "this user has a
     # pending task") that doesn't exist yet -- that's an integration-time
@@ -336,21 +394,30 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_stop_controller)
 
-    routing_agent = RoutingAgent(controller, guard, latest_transcript, wake_state, settings.wake_word)
+    routing_agent = RoutingAgent(
+        controller, guard, latest_transcript, wake_state, settings.wake_word, settings.sleep_word
+    )
     agent_ref.agent = routing_agent
     await session.start(agent=routing_agent, room=ctx.room)
 
 
-def main() -> None:
-    # Read SENTRY_DSN straight from the environment rather than through
-    # Settings(): Settings requires GOOGLE_API_KEY too, and eagerly
-    # constructing it here would reintroduce the exact bug already fixed
-    # once -- `voice-service --help` failing with no keys set.
+def _init_sentry() -> None:
+    """Read SENTRY_DSN straight from the environment rather than through
+    Settings(): Settings requires GOOGLE_API_KEY too, and eagerly
+    constructing it here would reintroduce the exact bug already fixed
+    once -- `voice-service --help` failing with no keys set.
+
+    Split out of main() so this branch is unit-testable without also
+    invoking cli.run_app()."""
     sentry_dsn = os.environ.get("SENTRY_DSN")
     if sentry_dsn:
         import sentry_sdk
 
         sentry_sdk.init(dsn=sentry_dsn, traces_sample_rate=0.1)
+
+
+def main() -> None:
+    _init_sentry()
 
     # ws_url/api_key/api_secret are left unset here: WorkerOptions already
     # falls back to the LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET env

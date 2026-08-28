@@ -6,12 +6,10 @@ Anthropic key in this environment. Everything downstream of routing --
 CollectiveOSClient, ConversationController's event relay, the interrupt and
 confirmation-response handling -- runs unmocked, over a real socket.
 
-Every locally-gated action (new_intent, modify_inflight, ...) now proposes
-and waits for a local "yes go ahead" before ConversationController actually
-sends anything -- see conversation.py's _pending_action gate. Each such
-step below is followed by an explicit approval utterance before checking
-for CollectiveOS's own (separate, unaffected) response.
-confirmation_reply stays exempt from the local gate, unchanged.
+Confirmation is risk-tiered, not blanket (see conversation.py's module
+docstring): new_intent/modify_inflight/session_query forward immediately;
+CollectiveOS's own confirmation_request/risk_class:write is what actually
+pauses for a write, exactly as scripted in mock_agent_backend/scenarios.py.
 """
 
 from __future__ import annotations
@@ -68,22 +66,16 @@ def test_scenario_a_end_to_end_including_mid_confirmation_edit():
             controller = ConversationController(client=CollectiveOSClient(ws_url), speak=speak)
             await controller.start(session_id=str(uuid4()), user_id=str(uuid4()))
 
-            # 1. new_intent -> local propose/approve -> sent -> ack, progress,
-            #    first confirmation_request.
+            # 1. new_intent -> ack, progress, first confirmation_request.
             await controller.handle_utterance(
                 "clear my morning, I'm sick", router_class="new_intent"
             )
-            assert controller.current_task_id is None  # proposed, not sent yet
-            await controller.handle_utterance("yes go ahead")  # approve the local proposal
-
             await _wait_until(lambda: any("Shall I go ahead" in t for t, _ in speak_calls))
             assert controller.current_task_id is not None
             assert controller.waiting_reason == "user_confirm"
 
-            # 2. mid-confirmation follow-up -> local propose/approve -> interrupt
-            #    -> modified confirmation_request.
+            # 2. mid-confirmation follow-up -> interrupt -> modified confirmation_request.
             await controller.handle_utterance("wait, keep the 10am", router_class="modify_inflight")
-            await controller.handle_utterance("yes go ahead")  # approve the local proposal
             await _wait_until(
                 lambda: any("keep the 10am" in t and "Shall I go ahead" in t for t, _ in speak_calls)
             )
@@ -122,14 +114,12 @@ def test_scenario_c_partial_failure_end_to_end():
             await controller.handle_utterance(
                 "cancel the subscriptions I'm not using", router_class="new_intent"
             )
-            await controller.handle_utterance("yes go ahead")  # approve the local proposal
             await _wait_until(lambda: controller.waiting_reason == "user_confirm")
 
             await controller.handle_utterance("yes, cancel them", router_class="confirmation_reply")
             # mock backend holds the batch open ~0.3s for a mid-flight interrupt
             await asyncio.sleep(0.05)
             await controller.handle_utterance("wait, keep Spotify", router_class="modify_inflight")
-            await controller.handle_utterance("yes go ahead")  # approve the local proposal
 
             await _wait_until(lambda: any("Done" in t for t, _ in speak_calls), timeout=3)
 

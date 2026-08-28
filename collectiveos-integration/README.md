@@ -33,9 +33,14 @@ substantive event → relay until `session_end`), same event models
 (`libs/voice-contract`, already a real installable package this endpoint
 could depend on directly). What differs is everything `scenarios.py`
 currently *scripts*: CollectiveOS replaces the scripted event sequences
-with its actual Claude tool-loop output, and `session.py`'s in-memory
-`STORE` becomes real reads/writes against `tasks`/`task_steps` and the new
-`voice_sessions` table.
+with its actual agent output — internally calling its own tool backends
+over MCP, per its own architecture — and `session.py`'s in-memory `STORE`
+becomes real reads/writes against `tasks`/`task_steps` and the new
+`voice_sessions` table. MCP is entirely internal to that agent loop; it
+never appears on `/contract` (see `contract/README.md`'s "Relationship to
+MCP") — this endpoint's job is exactly the same shape whether the tool
+call behind an `ack`/`progress`/`done` was implemented via MCP, a direct
+SDK call, or anything else.
 
 ## Integration-day checklist
 
