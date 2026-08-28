@@ -26,7 +26,7 @@ from typing import Any, Protocol
 from google import genai
 from google.genai import types
 
-DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 
 class GeminiModelsClient(Protocol):

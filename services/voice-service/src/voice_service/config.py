@@ -42,13 +42,13 @@ class Settings(BaseSettings):
     # plugin sets mutable_instructions=False for any "3.1" model), which
     # would break generate_reply(instructions=...)-driven speech entirely.
     gemini_live_model: str = Field(
-        default="gemini-2.5-flash-native-audio-preview-12-2025",
+        default="gemini-3.6-flash-live-001",
         validation_alias="GEMINI_LIVE_MODEL",
     )
 
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     gemini_api_key: str | None = Field(default=None, validation_alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-flash-latest", validation_alias="GEMINI_MODEL")
+    gemini_model: str = Field(default="gemini-3.6-flash", validation_alias="GEMINI_MODEL")
 
     # Explicit override for when both keys happen to be set. Unset means
     # "pick whichever one key is actually present"; if both are present
