@@ -52,12 +52,13 @@ class Settings(BaseSettings):
     # `"3.1" not in model`, not real capability detection, so it can't
     # tell you a new model is safe; only a live session can.
     gemini_live_model: str = Field(
-        default="gemini-2.5-flash-native-audio-preview-12-2025",
+        default="gemini-3.6-flash-live-001",
         validation_alias="GEMINI_LIVE_MODEL",
     )
 
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     gemini_api_key: str | None = Field(default=None, validation_alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-3.6-flash", validation_alias="GEMINI_MODEL")
     # "-latest" is an alias Google keeps pointed at their current
     # recommended flash model -- deliberately not pinned to a dated
     # string like gemini_live_model above has to be, so this one never
