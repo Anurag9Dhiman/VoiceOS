@@ -30,6 +30,16 @@ local pre-send gate here would either be redundant with that (for writes)
 or needless friction (for reads) -- an earlier revision of this file
 added exactly that blanket gate and it was deliberately removed once this
 became clear.
+
+Local fallback (alongside CollectiveOS, not a replacement for it): if
+CollectiveOS is unreachable -- `start()`'s connect() fails, or a later
+send() does -- and a `local_agent` was configured (see local_agent.py;
+optional, off unless the `local-agent` extra is installed and wired in
+agent.py), every category that would otherwise forward gets answered by
+it instead, framed so it can never claim to have executed a real task
+(voice-service holds zero connector credentials by design). With no
+`local_agent` configured, this is exactly today's behavior: the
+exception propagates.
 """
 
 from __future__ import annotations
@@ -62,6 +72,7 @@ from voice_contract import (
 from .ack import AckGenerator
 from .collectiveos_client import CollectiveOSTransport
 from .entity_stack import EntityStack
+from .local_agent import LocalFallbackAgent
 from .rate_limiter import InMemoryRateLimiter, RateLimiter
 from .router import HaikuRouter
 from .session_store import InMemorySessionStore, SessionSnapshot, SessionStore
@@ -101,6 +112,7 @@ class ConversationController:
         entities: EntityStack | None = None,
         session_store: SessionStore | None = None,
         rate_limiter: RateLimiter | None = None,
+        local_agent: LocalFallbackAgent | None = None,
         on_task_state_changed: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._client = client
@@ -110,6 +122,11 @@ class ConversationController:
         self._entities = entities or EntityStack()
         self._session_store = session_store or InMemorySessionStore()
         self._rate_limiter = rate_limiter or InMemoryRateLimiter()
+        # Optional: see module docstring's "Local fallback" section. None
+        # (the default) means CollectiveOS being unreachable behaves
+        # exactly as it always has -- an exception propagates.
+        self._local_agent = local_agent
+        self._degraded = False
         # Optional: notified whenever current_task_id/waiting_reason may have
         # changed, so a caller with no other way to observe this state (e.g.
         # a Gemini Live session, which has no per-call has_active_task
@@ -159,8 +176,39 @@ class ConversationController:
                 if snapshot.active_task_ids and self._on_task_state_changed is not None:
                     await self._on_task_state_changed()
 
-        await self._client.connect(session_id=session_id, user_id=user_id, resume=resume)
+        try:
+            await self._client.connect(session_id=session_id, user_id=user_id, resume=resume)
+        except Exception:
+            if self._local_agent is None:
+                raise
+            logger.warning(
+                "CollectiveOS unreachable at session start (session %s) -- falling back to the local agent",
+                session_id,
+            )
+            self._degraded = True
+            return
         self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def _send_or_fallback(self, event: object, text: str) -> None:
+        """CollectiveOS being unreachable is not a crash: falls back to
+        the local agent (if one is configured) instead of forwarding --
+        either because start() already found CollectiveOS unreachable
+        (self._degraded) or because this send() call itself fails, which
+        also latches self._degraded so later turns this call don't
+        re-attempt a doomed send(). With no local agent configured, this
+        is exactly today's behavior: the exception propagates."""
+        if not self._degraded:
+            try:
+                await self._client.send(event)  # type: ignore[arg-type]
+                return
+            except Exception:
+                if self._local_agent is None:
+                    raise
+                logger.warning("send() failed, CollectiveOS unreachable -- falling back locally: %r", text)
+                self._degraded = True
+
+        reply = await self._local_agent.respond(text)  # type: ignore[union-attr]
+        await self._speak(reply, "low")
 
     async def stop(self) -> None:
         await self._persist_session(ended=True)
@@ -190,13 +238,14 @@ class ConversationController:
                 logger.warning("confirmation_reply with no active task, dropping: %r", text)
                 return
             decision, modification = _parse_decision(text)
-            await self._client.send(
+            await self._send_or_fallback(
                 ConfirmationResponse(
                     session_id=self._session_id,
                     task_id=self.current_task_id,
                     decision=decision,
                     modification=modification,
-                )
+                ),
+                text,
             )
             return
 
@@ -204,8 +253,9 @@ class ConversationController:
             if self.current_task_id is None:
                 logger.warning("modify_inflight with no active task, dropping: %r", text)
                 return
-            await self._client.send(
-                Interrupt(session_id=self._session_id, target_task_id=self.current_task_id, text=text)
+            await self._send_or_fallback(
+                Interrupt(session_id=self._session_id, target_task_id=self.current_task_id, text=text),
+                text,
             )
             return
 
@@ -216,19 +266,20 @@ class ConversationController:
 
         if router_class == "new_intent":
             entity_refs = self._entities.resolve(text)
-            await self._client.send(
+            await self._send_or_fallback(
                 UserUtterance(
                     session_id=self._session_id,
                     text=text,
                     router_class="new_intent",
                     entity_refs=entity_refs,
                     ts=datetime.now(UTC).isoformat(),
-                )
+                ),
+                text,
             )
             return
 
         if router_class == "session_query":
-            await self._client.send(SessionQuery(session_id=self._session_id, query=text))
+            await self._send_or_fallback(SessionQuery(session_id=self._session_id, query=text), text)
             return
 
         logger.warning("unhandled router_class %r for utterance %r", router_class, text)

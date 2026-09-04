@@ -22,17 +22,23 @@ class FakeClient:
     test push agent_to_voice events for the controller's receive loop to
     consume, without touching a real socket."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fail_connect: bool = False, fail_send: bool = False) -> None:
         self.sent: list[object] = []
         self.connected = False
         self.closed = False
+        self.fail_connect = fail_connect
+        self.fail_send = fail_send
         self._queue: asyncio.Queue = asyncio.Queue()
 
     async def connect(self, *, session_id, user_id, resume=False):
+        if self.fail_connect:
+            raise ConnectionRefusedError("simulated: CollectiveOS unreachable")
         self.connected = True
         self.session_id = session_id
 
     async def send(self, event):
+        if self.fail_send:
+            raise ConnectionResetError("simulated: CollectiveOS dropped mid-send")
         self.sent.append(event)
 
     def push(self, event) -> None:
@@ -61,6 +67,19 @@ class FakeAck:
         return f"ack:{router_class}"
 
 
+class FakeLocalAgent:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+        self.closed = False
+
+    async def respond(self, text: str) -> str:
+        self.prompts.append(text)
+        return f"local-fallback-answer-to: {text}"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 async def _settle() -> None:
     """Let the controller's background receive-loop task process whatever
     was just pushed onto the fake client's queue."""
@@ -68,7 +87,7 @@ async def _settle() -> None:
     await asyncio.sleep(0)
 
 
-def _controller(client: FakeClient, router_class: str | None = None):
+def _controller(client: FakeClient, router_class: str | None = None, *, local_agent=None):
     speak_calls: list[tuple[str, str]] = []
 
     async def speak(text, priority):
@@ -79,6 +98,7 @@ def _controller(client: FakeClient, router_class: str | None = None):
         speak=speak,
         router=FakeRouter(router_class) if router_class else None,
         ack=FakeAck(),
+        local_agent=local_agent,
     )
     return controller, speak_calls
 
@@ -505,5 +525,105 @@ def test_stop_without_ever_starting_does_not_persist_a_session():
         await controller.stop()  # must not raise
 
         assert await store.load("u1") is None
+
+    asyncio.run(scenario())
+
+
+def test_connect_failure_with_no_local_agent_still_raises():
+    """The one invariant that must hold: with no local_agent configured
+    (today's default), CollectiveOS being unreachable at session start
+    behaves exactly as it always has."""
+
+    async def scenario():
+        client = FakeClient(fail_connect=True)
+        controller, _ = _controller(client)
+
+        with pytest.raises(ConnectionRefusedError):
+            await controller.start(session_id="s1", user_id="u1")
+
+    asyncio.run(scenario())
+
+
+def test_connect_failure_with_a_local_agent_enters_degraded_mode_without_raising():
+    async def scenario():
+        client = FakeClient(fail_connect=True)
+        local_agent = FakeLocalAgent()
+        controller, _ = _controller(client, local_agent=local_agent)
+
+        await controller.start(session_id="s1", user_id="u1")  # must not raise
+
+        assert controller._degraded is True
+
+    asyncio.run(scenario())
+
+
+def test_new_intent_falls_back_to_the_local_agent_when_collectiveos_is_unreachable_from_the_start():
+    async def scenario():
+        client = FakeClient(fail_connect=True)
+        local_agent = FakeLocalAgent()
+        controller, speak_calls = _controller(client, "new_intent", local_agent=local_agent)
+        await controller.start(session_id="s1", user_id="u1")
+
+        await controller.handle_utterance("clear my morning, I'm sick")
+
+        assert local_agent.prompts == ["clear my morning, I'm sick"]
+        assert speak_calls == [("local-fallback-answer-to: clear my morning, I'm sick", "low")]
+        assert client.sent == []  # never actually reached CollectiveOS
+
+    asyncio.run(scenario())
+
+
+def test_send_failure_mid_call_falls_back_and_latches_degraded_for_later_turns():
+    """CollectiveOS connects fine but a later send() fails -- the
+    fallback engages for that turn, and stays engaged for subsequent
+    turns without re-attempting a doomed send()."""
+
+    async def scenario():
+        client = FakeClient(fail_send=True)
+        local_agent = FakeLocalAgent()
+        controller, speak_calls = _controller(client, "new_intent", local_agent=local_agent)
+        await controller.start(session_id="s1", user_id="u1")
+        assert controller._degraded is False  # connect() itself succeeded
+
+        await controller.handle_utterance("clear my morning")
+
+        assert controller._degraded is True  # latched after the failed send()
+        assert local_agent.prompts == ["clear my morning"]
+        assert client.sent == []
+
+        # A second turn doesn't try client.send() again -- goes straight
+        # to the local agent.
+        client.fail_send = False  # even if it "recovered", degraded is latched
+        await controller.handle_utterance("what's on my calendar")
+
+        assert local_agent.prompts == ["clear my morning", "what's on my calendar"]
+        assert client.sent == []
+
+    asyncio.run(scenario())
+
+
+def test_send_failure_with_no_local_agent_still_raises():
+    async def scenario():
+        client = FakeClient(fail_send=True)
+        controller, _ = _controller(client, "new_intent")
+        await controller.start(session_id="s1", user_id="u1")
+
+        with pytest.raises(ConnectionResetError):
+            await controller.handle_utterance("clear my morning")
+
+    asyncio.run(scenario())
+
+
+def test_session_query_also_falls_back_when_degraded():
+    async def scenario():
+        client = FakeClient(fail_connect=True)
+        local_agent = FakeLocalAgent()
+        controller, speak_calls = _controller(client, "session_query", local_agent=local_agent)
+        await controller.start(session_id="s1", user_id="u1")
+
+        await controller.handle_utterance("where were we")
+
+        assert local_agent.prompts == ["where were we"]
+        assert speak_calls == [("local-fallback-answer-to: where were we", "low")]
 
     asyncio.run(scenario())

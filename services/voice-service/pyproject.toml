@@ -15,6 +15,15 @@ dependencies = [
     "websockets>=14.0,<17.0",
 ]
 
+[project.optional-dependencies]
+# Opt-in: gives voice-service a local, agentkit-backed fallback for when
+# CollectiveOS is unreachable (see local_agent.py). Not a hard dependency
+# -- agentkit lives as a sibling checkout outside this monorepo, so
+# requiring it unconditionally would break `uv sync` for anyone who
+# clones this repo without also having agentkit checked out at that
+# exact relative path.
+local-agent = ["agentkit[gemini]"]
+
 [project.scripts]
 voice-service = "voice_service:main"
 
@@ -31,3 +40,4 @@ dev = [
 [tool.uv.sources]
 voice-contract = { path = "../../libs/voice-contract", editable = true }
 mock-agent-backend = { path = "../mock-agent-backend", editable = true }
+agentkit = { path = "../../../agentkit", editable = true }

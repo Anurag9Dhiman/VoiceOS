@@ -105,6 +105,23 @@ concern from the live audio path, which needs its own `GOOGLE_API_KEY`.
    the entity stack are snapshotted to a `SessionStore` (`session_store.py`
    — in-memory by default, Redis in production) keyed by user_id, so a
    session that resumes hours or days later picks up where it left off.
+6. **If CollectiveOS is unreachable** — `start()`'s `connect()` fails, or
+   a later `send()` does — step 3's forwarding falls back to a local,
+   `agentkit`-backed agent (`local_agent.py`) instead of crashing or
+   going silent, *if one is configured* (`uv sync --extra local-agent`;
+   `agentkit` is a separate framework, a sibling checkout outside this
+   monorepo — see its own README). This is **alongside** CollectiveOS
+   routing, not a replacement: it only ever engages once the real client
+   has already failed, and a `send()` failure latches degraded mode so
+   later turns in the same call don't re-attempt a doomed send. With
+   nothing configured (the default — the extra changes nothing on its
+   own until wired into `agent.py`'s `_build_local_agent()`), this is
+   exactly today's behavior: the exception propagates. voice-service
+   holds zero connector credentials by design, so this fallback
+   structurally cannot execute a real task no matter what it's asked —
+   its prompt framing makes that explicit on every call, confirmed live
+   (not just by reading the prompt) that the model doesn't free-text-claim
+   to have completed something it didn't.
 
 Every call into `handle_utterance` is metered first, before the router or
 CollectiveOS ever sees it: `rate_limiter.py`'s per-user token bucket
@@ -126,6 +143,12 @@ mock-agent-backend over an actual socket**:
   real network drop), and the **same** `ConversationController` — not a
   freshly constructed one — reconnects with backoff, resumes, and finishes
   the task
+- `tests/test_e2e_local_fallback.py` — the mock backend process is
+  actually stopped mid-call (not simulated), every reconnect attempt
+  against it genuinely fails, and the local fallback (a fake agent here;
+  the real `agentkit`-backed one's safety framing is verified separately,
+  live — see local_agent.py) engages instead of hanging or crashing, then
+  latches so a further turn doesn't re-attempt a doomed send()
 
 The router is bypassed in all three via an explicit `router_class` argument
 (no live LLM key of either kind in this environment) — everything else,
@@ -134,7 +157,7 @@ instances sharing one `SessionStore`, runs unmocked.
 
 ## What's here vs. what needs live credentials or infrastructure to prove out
 
-Unit- and integration-tested (155 tests, all green — 93% statement
+Unit- and integration-tested (166 tests, all green — 93% statement
 coverage; every remaining uncovered line is `entrypoint()`/`main()`/the
 router-eval CLI or `wake_gate.py`'s real audio adapter, all of which need
 live credentials or a real room to exercise, not more unit tests): the
@@ -253,6 +276,13 @@ uv run voice-service console
 
 # score the router against the labeled eval set (needs a live LLM key)
 uv run python -m voice_service.router_eval
+
+# optional: local, agentkit-backed fallback for when CollectiveOS is
+# unreachable (see "How a turn flows" step 6). Needs the agentkit repo
+# checked out as a sibling of this monorepo -- ../../../agentkit from
+# here. Without this, nothing changes: CollectiveOS being unreachable
+# behaves exactly as it does today.
+uv sync --extra local-agent
 ```
 
 `config.py` requires `GOOGLE_API_KEY` unconditionally (it authenticates the
