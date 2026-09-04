@@ -73,6 +73,7 @@ from .conversation import ConversationController
 from .entity_stack import EntityStack
 from .latency import LatencyAggregator
 from .llm_provider import make_llm_client
+from .local_agent import LocalFallbackAgent, build_local_agent
 from .rate_limiter import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
 from .resilient_client import ReconnectingCollectiveOSClient
 from .router import _ROUTER_CLASSES, _SYSTEM_PROMPT
@@ -299,6 +300,15 @@ def _build_wake_detector() -> WakeWordDetector | None:
     return None
 
 
+def _build_local_agent(settings: Settings) -> LocalFallbackAgent | None:
+    """None unless the `local-agent` extra is installed -- see
+    local_agent.py's build_local_agent(), which does the actual import
+    attempt. When it returns a real agent, ConversationController falls
+    back to it instead of crashing/going silent if CollectiveOS is
+    unreachable; when it's None (today's default), nothing changes."""
+    return build_local_agent(api_key=settings.google_api_key)
+
+
 def _build_stores(settings: Settings) -> tuple[SessionStore, RateLimiter]:
     """Split out of entrypoint() so this branch -- the entire reason
     REDIS_URL exists -- is unit-testable on its own. RedisRateLimiter was
@@ -359,6 +369,7 @@ async def entrypoint(ctx: JobContext) -> None:
         )
 
     session_store, rate_limiter = _build_stores(settings)
+    local_agent = _build_local_agent(settings)
 
     controller = ConversationController(
         client=ReconnectingCollectiveOSClient(settings.collectiveos_ws_url),
@@ -367,6 +378,7 @@ async def entrypoint(ctx: JobContext) -> None:
         entities=EntityStack(),
         session_store=session_store,
         rate_limiter=rate_limiter,
+        local_agent=local_agent,
         on_task_state_changed=_on_task_state_changed,
     )
 
@@ -391,6 +403,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def _stop_controller() -> None:
         await controller.stop()
+        if local_agent is not None:
+            await local_agent.aclose()
 
     ctx.add_shutdown_callback(_stop_controller)
 

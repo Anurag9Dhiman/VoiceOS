@@ -8,6 +8,36 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "agentkit"
+version = "0.1.0"
+source = { editable = "../../../agentkit" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyyaml" },
+]
+
+[package.optional-dependencies]
+gemini = [
+    { name = "google-genai" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=2.18.1" },
+    { name = "pydantic", specifier = ">=2" },
+    { name = "pydantic-settings", specifier = ">=2" },
+    { name = "pyyaml", specifier = ">=6" },
+]
+provides-extras = ["gemini"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest-asyncio", specifier = ">=1.4.0" },
+]
+
+[[package]]
 name = "aiofiles"
 version = "25.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2355,6 +2385,11 @@ dependencies = [
     { name = "websockets" },
 ]
 
+[package.optional-dependencies]
+local-agent = [
+    { name = "agentkit", extra = ["gemini"] },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "mock-agent-backend" },
@@ -2363,6 +2398,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agentkit", extras = ["gemini"], marker = "extra == 'local-agent'", editable = "../../../agentkit" },
     { name = "anthropic", specifier = ">=0.40" },
     { name = "google-genai", specifier = ">=2.18.1" },
     { name = "langsmith", specifier = ">=0.11.1" },
@@ -2373,6 +2409,7 @@ requires-dist = [
     { name = "voice-contract", editable = "../../libs/voice-contract" },
     { name = "websockets", specifier = ">=14.0,<17.0" },
 ]
+provides-extras = ["local-agent"]
 
 [package.metadata.requires-dev]
 dev = [
